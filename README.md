@@ -6,27 +6,25 @@ The framework models predator and prey with separate role-specific policies and 
 
 <table>
 <tr>
-
 <td align="center" width="50%">
 
-<a href="assets/videos/real.mp4">
-  <img src="assets/videos/real_preview.gif" width="100%" alt="Aquarium Recording">
-</a>
+<strong>Aquarium Recording</strong><br><br>
 
-<strong>Aquarium Recording</strong>
+<img src="assets/videos/real_preview.gif"
+     width="75%"
+     alt="Aquarium Recording">
 
 </td>
 
 <td align="center" width="50%">
 
-<a href="assets/videos/sim.mp4">
-  <img src="assets/videos/sim_preview.gif" width="100%" alt="Policy Rollout">
-</a>
+<strong>Policy Rollout</strong><br><br>
 
-<strong>Policy Rollout</strong>
+<img src="assets/videos/sim_preview.gif"
+     width="75%"
+     alt="Policy Rollout">
 
 </td>
-
 </tr>
 </table>
 
@@ -39,7 +37,7 @@ The framework models predator and prey with separate role-specific policies and 
 </p>
 
 <p align="center">
-  <img src="assets/images/gail.png" width="400">
+  <img src="assets/images/gail.png" width="500">
 </p>
 
 <br>
