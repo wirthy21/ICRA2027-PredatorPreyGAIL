@@ -1,6 +1,4 @@
-from pathlib import Path
-
-readme = r"""# Learning Predator–Prey Interactions from Real-World Animal Behavior 🦈🐟
+# Learning Predator–Prey Interactions from Real-World Animal Behavior 🦈🐟
 
 This repository accompanies our paper on learning predator–prey dynamics from synthetic and real-world animal trajectories using **Generative Adversarial Imitation Learning (GAIL)**.
 
