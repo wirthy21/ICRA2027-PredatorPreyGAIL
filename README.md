@@ -1,6 +1,6 @@
 # Learning Predator–Prey Interactions from Real-World Animal Behavior 🦈🐟
 
-This repository accompanies our paper on learning predator–prey dynamics from synthetic and real-world animal trajectories using **Generative Adversarial Imitation Learning (GAIL)**.
+This repository accompanies our paper on learning predator–prey dynamics from synthetic and real-world animal trajectories using Generative Adversarial Imitation Learning (GAIL).
 
 The framework models predator and prey with separate role-specific policies and discriminators and applies alternating co-training to their conflicting behavioral objectives. Synthetic Couzin-based demonstrations are used for controlled verification before applying the same architecture to trajectories reconstructed from aquarium recordings.
 
