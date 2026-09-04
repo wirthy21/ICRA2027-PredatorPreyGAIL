@@ -1756,7 +1756,8 @@ def cluster_bootstrap_risk_conditioned_mean(
     first = _as_float_tensor(x_by_cluster[0])
     edges = _as_float_tensor(bin_edges, device=first.device, dtype=first.dtype)
     n_bins = len(edges) - 1
-    cluster_sums, cluster_counts = [], []
+    cluster_sums, cluster_counts, cluster_candidate_counts = [], [], []
+    nonfinite_distance_count = below_range_count = above_range_count = 0
     if bin_indices_by_cluster is not None and len(bin_indices_by_cluster) != len(x_by_cluster):
         raise ValueError("bin_indices_by_cluster must match the cluster sequences")
     for cluster_index, (x, values) in enumerate(zip(x_by_cluster, values_by_cluster)):
@@ -1766,13 +1767,23 @@ def cluster_bootstrap_risk_conditioned_mean(
                  torch.as_tensor(bin_indices_by_cluster[cluster_index], device=first.device, dtype=torch.long).flatten())
         if index.shape != x.shape:
             raise ValueError("Each cached bin-index tensor must match its x cluster")
-        valid = (index >= 0) & torch.isfinite(values)
+        finite_distance = torch.isfinite(x)
+        in_range = index >= 0
+        valid = in_range & torch.isfinite(values)
+        cluster_candidate_counts.append(torch.bincount(index[in_range], minlength=n_bins))
         cluster_counts.append(torch.bincount(index[valid], minlength=n_bins))
         cluster_sums.append(torch.bincount(index[valid], weights=values[valid], minlength=n_bins))
+        nonfinite_distance_count += int((~finite_distance).sum())
+        below_range_count += int((finite_distance & (x < edges[0])).sum())
+        above_range_count += int((finite_distance & (x > edges[-1])).sum())
     sums = torch.stack(cluster_sums)
     counts = torch.stack(cluster_counts)
+    candidate_counts = torch.stack(cluster_candidate_counts)
     total_count = counts.sum(dim=0)
+    total_candidate_count = candidate_counts.sum(dim=0)
     cluster_count = (counts > 0).sum(dim=0)
+    candidate_cluster_count = (candidate_counts > 0).sum(dim=0)
+    missing_value_count = total_candidate_count - total_count
     mean = sums.sum(dim=0) / total_count.clamp_min(1).to(sums.dtype)
     per_cluster_mean = sums / counts.clamp_min(1).to(sums.dtype)
     per_cluster_mean[counts == 0] = torch.nan
@@ -1810,7 +1821,14 @@ def cluster_bootstrap_risk_conditioned_mean(
             "clip_balanced_mean": clip_balanced_mean,
             "clip_balanced_ci_low": clip_balanced_ci_low,
             "clip_balanced_ci_high": clip_balanced_ci_high,
-            "cluster_count": cluster_count, "supported": supported}
+            "cluster_count": cluster_count, "supported": supported,
+            # Diagnostics distinguish metric NaNs from distance-range clipping.
+            "candidate_count": total_candidate_count,
+            "candidate_cluster_count": candidate_cluster_count,
+            "missing_value_count": missing_value_count,
+            "nonfinite_distance_count": torch.tensor(nonfinite_distance_count, device=edges.device),
+            "below_range_count": torch.tensor(below_range_count, device=edges.device),
+            "above_range_count": torch.tensor(above_range_count, device=edges.device)}
 
 
 def compute_group_size_difference(value_16: Any, value_32: Any) -> torch.Tensor:
@@ -2282,6 +2300,12 @@ def analyze_case(
                             "clip_balanced_ci_high": empty.clone(),
                             "count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
                             "cluster_count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
+                            "candidate_count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
+                            "candidate_cluster_count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
+                            "missing_value_count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
+                            "nonfinite_distance_count": torch.tensor(0, device=edges.device),
+                            "below_range_count": torch.tensor(0, device=edges.device),
+                            "above_range_count": torch.tensor(0, device=edges.device),
                             "supported": torch.zeros(len(empty), device=edges.device, dtype=torch.bool)}
         else:
             cache_key = tuple((x.data_ptr(), x.numel()) for x in curve_x[name])
@@ -2329,6 +2353,10 @@ def analyze_case(
         "nnd_during_approach": nnd_profiles,
         "polarization_during_approach": polarization_profiles,
         "response_availability": response_availability,
+        # Retain the already-computed per-clip samples for diagnostic rebinning.
+        "risk_curve_clusters": {
+            name: {"x": curve_x[name], "values": curve_y[name]} for name in curve_names
+        },
     }
 
 
