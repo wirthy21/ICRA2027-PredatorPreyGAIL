@@ -401,6 +401,335 @@ def load_expert_trajectories(source: str | Path, *, n_prey: int, **kwargs: Any) 
     return load_expert_32prey(source, n_prey=n_prey, **kwargs)
 
 
+def _load_torch_tensor(path: Path) -> torch.Tensor:
+    """Load a tensor artifact on CPU, including long Windows paths."""
+
+    binary_path = _windows_binary_path(path)
+    if not os.path.isfile(binary_path):
+        raise ExpertDataUnavailable(f"Usable pairwise tensor file not found: {path}")
+    try:
+        with open(binary_path, "rb") as handle:
+            is_pointer = handle.read(100).startswith(b"version https://git-lfs.github.com/spec/v1")
+    except OSError:
+        is_pointer = True
+    if is_pointer:
+        raise ExpertDataUnavailable(f"Pairwise tensor is an unavailable Git-LFS pointer: {path}")
+    try:
+        value = torch.load(binary_path, map_location="cpu", weights_only=False)
+    except TypeError:  # torch < 2.0 has no weights_only argument
+        value = torch.load(binary_path, map_location="cpu")
+    if not torch.is_tensor(value):
+        raise ValueError(f"Expected one tensor in {path.name}, got {type(value).__name__}")
+    return value.detach().cpu()
+
+
+def _is_binary_channel(values: torch.Tensor, *, atol: float = 1e-6) -> bool:
+    finite = values[torch.isfinite(values)]
+    return bool(len(finite) and torch.all((finite.abs() <= atol) | ((finite - 1.0).abs() <= atol)))
+
+
+def _pairwise_tensor_layout(
+    predator_windows: torch.Tensor, prey_windows: torch.Tensor,
+) -> dict[str, Any]:
+    """Validate saved pairwise windows and locate mask/flag channels.
+
+    The hand-labelled files store ``[dx, dy, rel_vx, rel_vy, active,
+    theta_norm]`` for the predator. Prey files additionally prepend the flag
+    that identifies neighbor slot zero as the predator.
+    """
+
+    if predator_windows.ndim != 5 or predator_windows.shape[2] != 1:
+        raise ValueError("Predator windows must have shape [W,L,1,M,F]")
+    if prey_windows.ndim != 5 or prey_windows.shape[2] != prey_windows.shape[3]:
+        raise ValueError("Prey windows must have shape [W,L,M,M,F]")
+    if predator_windows.shape[:2] != prey_windows.shape[:2]:
+        raise ValueError("Predator and prey windows must share W and L")
+    if predator_windows.shape[3] != prey_windows.shape[2]:
+        raise ValueError("Predator and prey tensors must share the padded prey width")
+    if predator_windows.shape[-1] < 5 or prey_windows.shape[-1] < 5:
+        raise ValueError("Pairwise tensors require at least five feature channels")
+
+    pred_active = (-2 if predator_windows.shape[-1] >= 6
+                   and _is_binary_channel(predator_windows[..., -2]) else None)
+    prey_active = (-2 if prey_windows.shape[-1] >= 6
+                   and _is_binary_channel(prey_windows[..., -2]) else None)
+    prey_flag = None
+    if prey_windows.shape[-1] >= 7 and _is_binary_channel(prey_windows[..., 0]):
+        flag = prey_windows[:, 0, :, :, 0]
+        expected = torch.zeros_like(flag); expected[:, :, 0] = 1.0
+        active_rows = (prey_windows[:, 0, :, :, prey_active].amax(dim=-1) > 0.5
+                       if prey_active is not None
+                       else torch.ones_like(flag[:, :, 0], dtype=torch.bool))
+        if torch.allclose(flag[active_rows], expected[active_rows], atol=1e-6, rtol=0):
+            prey_flag = 0
+
+    prey_offset = 1 if prey_flag is not None else 0
+    return {
+        "pred_position": (0, 1), "pred_velocity": (2, 3),
+        "pred_theta": predator_windows.shape[-1] - 1, "pred_active": pred_active,
+        "prey_position": (prey_offset, prey_offset + 1),
+        "prey_velocity": (prey_offset + 2, prey_offset + 3),
+        "prey_theta": prey_windows.shape[-1] - 1, "prey_active": prey_active,
+        "prey_flag": prey_flag, "window_length": int(predator_windows.shape[1]),
+        "max_prey": int(predator_windows.shape[3]),
+    }
+
+
+def _active_prey_count(
+    predator_windows: torch.Tensor, prey_windows: torch.Tensor, layout: Mapping[str, Any],
+) -> torch.Tensor:
+    """Return the true (unpadded) group size of every saved window."""
+
+    if layout["pred_active"] is not None:
+        return (predator_windows[:, 0, 0, :, layout["pred_active"]] > 0.5).sum(dim=-1)
+    if layout["prey_active"] is not None:
+        active = prey_windows[:, 0, :, :, layout["prey_active"]]
+        return (active.amax(dim=-1) > 0.5).sum(dim=-1)
+    return torch.full((predator_windows.shape[0],), layout["max_prey"], dtype=torch.long)
+
+
+def _stitch_pairwise_windows(
+    predator_windows: torch.Tensor, prey_windows: torch.Tensor, selected_indices: torch.Tensor,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Undo stride-one window extraction and recover independent sequences."""
+
+    indices = selected_indices.to(dtype=torch.long, device="cpu").flatten()
+    if not len(indices):
+        return []
+    chosen = predator_windows.index_select(0, indices)
+    overlap = (torch.empty(0, dtype=torch.bool) if len(chosen) == 1 else
+               (chosen[:-1, 1:] == chosen[1:, :-1]).reshape(len(chosen) - 1, -1).all(dim=1))
+    starts = [0] + (torch.nonzero(~overlap, as_tuple=False).flatten() + 1).tolist()
+    stops = starts[1:] + [len(indices)]
+    clips: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for start, stop in zip(starts, stops):
+        source_indices = indices[start:stop]
+        first = int(source_indices[0])
+        pred_parts, prey_parts = [predator_windows[first]], [prey_windows[first]]
+        if len(source_indices) > 1:
+            tail = source_indices[1:]
+            pred_parts.append(predator_windows.index_select(0, tail)[:, -1])
+            prey_parts.append(prey_windows.index_select(0, tail)[:, -1])
+        clips.append((torch.cat(pred_parts, dim=0), torch.cat(prey_parts, dim=0)))
+    return clips
+
+
+def _wrap_torch_angle(angle: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(angle + torch.pi, 2.0 * torch.pi) - torch.pi
+
+
+def _decode_theta_norm(value: torch.Tensor) -> torch.Tensor:
+    """Decode [0,1] angles while also accepting already-radian tensors."""
+
+    finite = value[torch.isfinite(value)]
+    if len(finite) and bool(finite.min() >= -1e-5) and bool(finite.max() <= 1.0 + 1e-5):
+        return _wrap_torch_angle(value * (2.0 * torch.pi) - torch.pi)
+    return _wrap_torch_angle(value)
+
+
+def _relative_prey_headings_from_velocity(
+    predator_velocity: torch.Tensor, prey_velocity: torch.Tensor, *, eps: float = 1e-8,
+) -> torch.Tensor:
+    """Recover each prey focal-frame angle relative to the predator frame."""
+
+    time, n_prey = predator_velocity.shape[:2]
+    result = predator_velocity.new_full((time, n_prey), torch.nan)
+    for focal in range(n_prey):
+        other = [index for index in range(n_prey) if index != focal]
+        slots = [index + 1 if index < focal else index for index in other]
+        pred_view = predator_velocity[:, other]
+        prey_view = prey_velocity[:, focal, slots]
+        valid = (pred_view.norm(dim=-1) > eps) & (prey_view.norm(dim=-1) > eps)
+        difference = _wrap_torch_angle(
+            torch.atan2(pred_view[..., 1], pred_view[..., 0])
+            - torch.atan2(prey_view[..., 1], prey_view[..., 0])
+        )
+        cosine = torch.where(valid, difference.cos(), 0.0).sum(dim=1)
+        sine = torch.where(valid, difference.sin(), 0.0).sum(dim=1)
+        result[:, focal] = torch.where(valid.any(dim=1), torch.atan2(sine, cosine), torch.nan)
+    return result
+
+
+def _integrate_heading(theta_norm: torch.Tensor) -> torch.Tensor:
+    heading = theta_norm.new_zeros(len(theta_norm))
+    if len(theta_norm) > 1:
+        heading[1:] = torch.cumsum(_decode_theta_norm(theta_norm[:-1]), dim=0)
+    return _wrap_torch_angle(heading)
+
+
+def _estimate_global_predator_heading(
+    predator_to_prey: torch.Tensor,
+    predator_frame_velocity: torch.Tensor,
+    theta_norm: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Align focal-frame velocities with common-axis relative-position changes."""
+
+    fallback = _integrate_heading(theta_norm)
+    if len(predator_to_prey) < 2:
+        return fallback
+    local = predator_frame_velocity[:-1] - predator_frame_velocity[:-1].mean(dim=1, keepdim=True)
+    world = torch.diff(predator_to_prey, dim=0)
+    world = world - world.mean(dim=1, keepdim=True)
+    dot = (local * world).sum(dim=(1, 2))
+    cross = (local[..., 0] * world[..., 1] - local[..., 1] * world[..., 0]).sum(dim=1)
+    strength = local.square().sum(dim=(1, 2)) * world.square().sum(dim=(1, 2))
+    estimate = torch.atan2(cross, dot)
+    heading = fallback.clone()
+    heading[:-1] = torch.where(strength > eps, estimate, heading[:-1])
+    if len(heading) > 1:
+        heading[-1] = _wrap_torch_angle(heading[-2] + _decode_theta_norm(theta_norm[-2]))
+    return _wrap_torch_angle(heading)
+
+
+def _pairwise_clip_to_records(
+    predator: torch.Tensor,
+    prey: torch.Tensor,
+    layout: Mapping[str, Any],
+    *,
+    n_prey: int,
+    clip_id: str,
+    condition: str,
+    coordinate_scale: float,
+) -> tuple[list[dict[str, Any]], str]:
+    """Create a metric-equivalent canonical clip from pairwise interactions."""
+
+    pred_position = predator[:, 0, :n_prey, list(layout["pred_position"])].float()
+    prey_pred_position = prey[:, :n_prey, 0, list(layout["prey_position"])].float()
+    pred_velocity = predator[:, 0, :n_prey, list(layout["pred_velocity"])].float()
+    prey_velocity = prey[:, :n_prey, :n_prey, :][..., list(layout["prey_velocity"])].float()
+
+    magnitude = pred_position.norm(dim=-1).mean().clamp_min(1e-8)
+    reciprocal_error = (pred_position + prey_pred_position).norm(dim=-1).mean() / magnitude
+    coordinate_mode = "common" if bool(reciprocal_error < 1e-4) else "local"
+    theta_norm = predator[:, 0, 0, layout["pred_theta"]].float()
+    if coordinate_mode == "local":
+        relative_heading = _wrap_torch_angle(
+            torch.atan2(-pred_position[..., 1], -pred_position[..., 0])
+            - torch.atan2(prey_pred_position[..., 1], prey_pred_position[..., 0])
+        )
+        predator_heading = _integrate_heading(theta_norm)
+        cosine, sine = predator_heading.cos(), predator_heading.sin()
+        x, y = pred_position[..., 0], pred_position[..., 1]
+        positions = torch.stack(
+            (cosine[:, None] * x - sine[:, None] * y,
+             sine[:, None] * x + cosine[:, None] * y), dim=-1,
+        )
+    else:
+        relative_heading = _relative_prey_headings_from_velocity(pred_velocity, prey_velocity)
+        predator_heading = _estimate_global_predator_heading(pred_position, pred_velocity, theta_norm)
+        positions = pred_position
+
+    prey_heading = _wrap_torch_angle(predator_heading[:, None] + relative_heading)
+    if torch.isnan(prey_heading).any():
+        missing = torch.isnan(prey_heading)
+        prey_turn = _decode_theta_norm(prey[:, :n_prey, 0, layout["prey_theta"]].float())
+        for time in range(1, len(prey_heading)):
+            fallback = _wrap_torch_angle(prey_heading[time - 1] + prey_turn[time - 1])
+            prey_heading[time] = torch.where(missing[time], fallback, prey_heading[time])
+        prey_heading = torch.nan_to_num(prey_heading, nan=0.0)
+
+    positions = positions * float(coordinate_scale)
+    rows: list[dict[str, Any]] = []
+    for time in range(len(predator)):
+        rows.append({
+            "source": "expert", "condition": condition, "clip_id": clip_id,
+            "frame": time, "time_step": time, "agent_id": "predator", "role": "predator",
+            "x": 0.0, "y": 0.0, "heading": float(predator_heading[time]), "policy_id": "",
+        })
+        for agent in range(n_prey):
+            rows.append({
+                "source": "expert", "condition": condition, "clip_id": clip_id,
+                "frame": time, "time_step": time, "agent_id": f"prey_{agent:02d}",
+                "role": "prey", "x": float(positions[time, agent, 0]),
+                "y": float(positions[time, agent, 1]),
+                "heading": float(prey_heading[time, agent]), "policy_id": "",
+            })
+    return rows, coordinate_mode
+
+
+def load_biological_window_trajectories(
+    window_root: str | Path,
+    *,
+    n_prey: int,
+    condition: str = "interaction",
+    coordinate_scale: float = 2160.0,
+) -> TrajectoryTable:
+    """Load hand-labelled pairwise windows as de-duplicated canonical clips.
+
+    The active mask separates padded 16- and 32-prey samples. Exact overlap is
+    then used to stitch stride-one windows before metric calculation, preventing
+    the repeated frames from inflating sample sizes and confidence intervals.
+    """
+
+    root = Path(window_root)
+    if root.name != "windows":
+        candidate = root / "expert_tensors" / "windows"
+        if candidate.is_dir():
+            root = candidate
+    if condition not in {"interaction", "attack", "all"}:
+        raise ValueError("condition must be 'interaction', 'attack', or 'all'")
+    if n_prey < 2:
+        raise ValueError("n_prey must be at least two")
+    if condition == "all":
+        folder = root / "10 windows"
+        pred_pattern, prey_pattern = "pred_tensors_hl_w*_n*.pkl", "prey_tensors_hl_w*_n*.pkl"
+    else:
+        folder = root / "10 windows (split by attack or interaction -- used for calculating speed)"
+        pred_pattern = f"pred_tensors_hl_{condition}_w*_n*.pkl"
+        prey_pattern = f"prey_tensors_hl_{condition}_w*_n*.pkl"
+    try:
+        names = os.listdir(_windows_binary_path(folder))
+    except OSError as exc:
+        raise ExpertDataUnavailable(f"Pairwise tensor directory is unavailable: {folder}") from exc
+    pred_paths = sorted(folder / name for name in names if Path(name).match(pred_pattern))
+    prey_paths = sorted(folder / name for name in names if Path(name).match(prey_pattern))
+    if len(pred_paths) != 1 or len(prey_paths) != 1:
+        raise ExpertDataUnavailable(
+            f"Expected one predator/prey hand-labelled tensor pair in {folder}; "
+            f"found {len(pred_paths)} and {len(prey_paths)}."
+        )
+
+    predator_windows = _load_torch_tensor(pred_paths[0])
+    prey_windows = _load_torch_tensor(prey_paths[0])
+    layout = _pairwise_tensor_layout(predator_windows, prey_windows)
+    counts = _active_prey_count(predator_windows, prey_windows, layout)
+    selected = torch.nonzero(counts == n_prey, as_tuple=False).flatten()
+    if not len(selected):
+        available = sorted(set(int(value) for value in counts.tolist()))
+        raise ExpertDataUnavailable(
+            f"No {n_prey}-prey windows in {folder}; available group sizes are {available}."
+        )
+
+    if layout["pred_active"] is not None:
+        active = predator_windows.index_select(0, selected)[..., layout["pred_active"]] > 0.5
+        expected = torch.zeros_like(active); expected[..., :n_prey] = True
+        if not torch.equal(active, expected):
+            raise ValueError("Active predator-neighbor slots are not a stable leading prey block")
+    if layout["prey_active"] is not None:
+        prey_mask = prey_windows[..., layout["prey_active"]]
+        active_agents = (prey_mask.index_select(0, selected).amax(dim=-1) > 0.5)
+        expected_agents = torch.zeros_like(active_agents); expected_agents[..., :n_prey] = True
+        if not torch.equal(active_agents, expected_agents):
+            raise ValueError("Active focal-prey slots are not a stable leading block")
+
+    clips = _stitch_pairwise_windows(predator_windows, prey_windows, selected)
+    rows: list[dict[str, Any]] = []
+    modes: set[str] = set()
+    for clip_index, (predator, prey_tensor) in enumerate(clips):
+        clip_rows, mode = _pairwise_clip_to_records(
+            predator, prey_tensor, layout, n_prey=n_prey,
+            clip_id=f"hand_{condition}_{n_prey}_{clip_index:03d}", condition=condition,
+            coordinate_scale=coordinate_scale,
+        )
+        rows.extend(clip_rows); modes.add(mode)
+    table = to_canonical_trajectory(rows)
+    if len(modes) > 1:
+        warnings.warn(f"Mixed pairwise coordinate conventions detected: {sorted(modes)}")
+    return table
+
+
 def _load_policy_source_modules(
     config: Mapping[str, Any], source_root: str | Path, *, include_simulator: bool = False,
 ) -> tuple[Any, Any, Any | None]:
@@ -1169,12 +1498,16 @@ def compute_reaction_metrics(
     *,
     response_threshold: float = 0.10,
     response_window_steps: int = 20,
+    response_lag: int = 1,
     d_source: float | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute first responses once and reuse them for all event metrics.
+    """Compute first responses over exactly ``response_window_steps`` transitions.
 
-    Availability is explicit, missing future observations are never counted as
-    non-responses, and propagation requires at least two responding prey.
+    Latencies and reaction distances refer to the end frame at which a response
+    first becomes observable.  Non-responders are confirmed only when their full
+    response window is observed; otherwise they are explicitly right-censored.
+    Fractions exclude censored prey from their denominator.  Raw cascade size is
+    reported only for events whose status is known for every prey.
     """
 
     response = _as_float_tensor(response)
@@ -1185,26 +1518,37 @@ def compute_reaction_metrics(
         raise ValueError("response and prey_positions must have shapes [T,N] and [T,N,2]")
     if response.shape[1] != prey_positions.shape[1]:
         raise ValueError("response and prey positions must have the same prey count")
-    if response_window_steps < 0:
-        raise ValueError("response_window_steps must be non-negative")
+    if response_window_steps < 1 or response_lag < 1:
+        raise ValueError("response_window_steps and response_lag must be positive")
 
     n_events, n_prey = len(onsets), response.shape[1]
-    offsets = torch.arange(response_window_steps + 1, device=response.device)
+    # W response samples encode exactly W transitions: e->e+lag through
+    # e+W-1->e+W-1+lag.  For lag=1, reported latencies are therefore 1..W.
+    offsets = torch.arange(response_window_steps, device=response.device)
     window_index = onsets[:, None] + offsets[None, :]
     availability = (window_index >= 0) & (window_index < response.shape[0])
     safe_index = (window_index.clamp(0, response.shape[0] - 1)
                   if response.shape[0] else torch.zeros_like(window_index))
     if response.shape[0]:
         response_window = response[safe_index]
-        response_mask = (response_window > response_threshold) & availability[..., None]
+        observed = torch.isfinite(response_window) & availability[..., None]
+        response_mask = (response_window > response_threshold) & observed
     else:
+        observed = torch.zeros(
+            (n_events, response_window_steps, n_prey),
+            device=response.device, dtype=torch.bool,
+        )
         response_mask = torch.zeros(
-            (n_events, response_window_steps + 1, n_prey),
+            (n_events, response_window_steps, n_prey),
             device=response.device, dtype=torch.bool,
         )
     responded = response_mask.any(dim=1)
+    full_prey_window = observed.all(dim=1)
+    confirmed_non_responder = (~responded) & full_prey_window
+    censored = (~responded) & (~full_prey_window)
     first_offset = response_mask.to(torch.int8).argmax(dim=1).long()
-    first_times = torch.where(responded, onsets[:, None] + first_offset, -1)
+    first_times = torch.where(
+        responded, onsets[:, None] + first_offset + int(response_lag), -1)
     reaction_distance = torch.full((n_events, n_prey), torch.nan, device=response.device, dtype=response.dtype)
     event_index, prey_index = torch.nonzero(responded, as_tuple=True)
     if len(event_index):
@@ -1219,18 +1563,25 @@ def compute_reaction_metrics(
 
     latency = torch.where(
         responded,
-        (first_times - onsets[:, None]).to(response.dtype),
+        (first_offset + int(response_lag)).to(response.dtype),
         torch.nan,
     )
-    cascade_size = responded.sum(dim=1)
-    fraction = cascade_size.to(response.dtype) / n_prey
+    observed_responder_count = responded.sum(dim=1)
+    confirmed_non_responder_count = confirmed_non_responder.sum(dim=1)
+    censored_count = censored.sum(dim=1)
+    classification_denominator = observed_responder_count + confirmed_non_responder_count
+    fraction = observed_responder_count.to(response.dtype) / classification_denominator.clamp_min(1).to(response.dtype)
+    fraction[classification_denominator == 0] = torch.nan
+    classification_complete = censored_count == 0
+    cascade_size = observed_responder_count.to(response.dtype)
+    cascade_size[~classification_complete] = torch.nan
     propagation_time = torch.full((n_events,), torch.nan, device=response.device, dtype=response.dtype)
     propagation_delay = torch.full_like(propagation_time, torch.nan)
     if n_events:
         sentinel = torch.iinfo(first_times.dtype).max
         first_response = torch.where(responded, first_times, sentinel).amin(dim=1)
         last_response = torch.where(responded, first_times, -1).amax(dim=1)
-        multi_response = cascade_size >= 2
+        multi_response = (observed_responder_count >= 2) & classification_complete
         propagation_time[multi_response] = (
             last_response[multi_response] - first_response[multi_response]
         ).to(response.dtype)
@@ -1239,15 +1590,27 @@ def compute_reaction_metrics(
         ).to(response.dtype)
         propagation_delay[multi_response] = (
             relative_times[multi_response].sum(dim=1)
-            / cascade_size[multi_response].to(response.dtype)
+            / observed_responder_count[multi_response].to(response.dtype)
         )
     result = {
         "event_onset": onsets,
         "availability": availability,
         "available_steps": availability.sum(dim=1),
-        "full_window_available": availability.all(dim=1),
+        # ``availability`` only checks tensor bounds; these fields additionally
+        # respect per-prey NaNs caused by gaps or a missing terminal transition.
+        "observed": observed,
+        "available_steps_per_prey": observed.sum(dim=1),
+        "full_prey_window": full_prey_window,
+        "full_window_available": full_prey_window.all(dim=1),
         "first_response_time": first_times,
         "responded": responded,
+        "confirmed_non_responder": confirmed_non_responder,
+        "censored": censored,
+        "observed_responder_count": observed_responder_count,
+        "confirmed_non_responder_count": confirmed_non_responder_count,
+        "censored_count": censored_count,
+        "classification_denominator": classification_denominator,
+        "classification_complete": classification_complete,
         "reaction_latency": latency,
         "reaction_distance": reaction_distance,
         "response_fraction": fraction,
@@ -1379,7 +1742,12 @@ def cluster_bootstrap_risk_conditioned_mean(
     ci_level: float = 0.95,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Binned mean with a vectorized independent-clip/rollout bootstrap."""
+    """Return sample-weighted and clip-balanced binned means with cluster CIs.
+
+    The historical ``mean``/``ci_*`` fields remain aliases for the
+    sample-weighted estimate.  The clip-balanced estimate first averages within
+    every clip and bin and then gives each contributing clip equal weight.
+    """
 
     if len(x_by_cluster) != len(values_by_cluster) or not x_by_cluster:
         raise ValueError("Equal non-empty cluster sequences are required")
@@ -1406,24 +1774,42 @@ def cluster_bootstrap_risk_conditioned_mean(
     total_count = counts.sum(dim=0)
     cluster_count = (counts > 0).sum(dim=0)
     mean = sums.sum(dim=0) / total_count.clamp_min(1).to(sums.dtype)
+    per_cluster_mean = sums / counts.clamp_min(1).to(sums.dtype)
+    per_cluster_mean[counts == 0] = torch.nan
+    clip_balanced_mean = torch.nanmean(per_cluster_mean, dim=0)
     supported = (total_count >= min_count) & (cluster_count >= min_cluster_count)
     mean[~supported] = torch.nan
+    clip_balanced_mean[~supported] = torch.nan
     ci_low = torch.full_like(mean, torch.nan)
     ci_high = torch.full_like(mean, torch.nan)
+    clip_balanced_ci_low = torch.full_like(mean, torch.nan)
+    clip_balanced_ci_high = torch.full_like(mean, torch.nan)
     if n_bootstrap and len(sums) >= 2:
         generator = torch.Generator(device=sums.device).manual_seed(seed)
         sample = torch.randint(len(sums), (n_bootstrap, len(sums)), device=sums.device, generator=generator)
         boot_count = counts[sample].sum(dim=1)
         boot_mean = sums[sample].sum(dim=1) / boot_count.clamp_min(1).to(sums.dtype)
         boot_mean[boot_count < min_count] = torch.nan
+        sampled_cluster_means = per_cluster_mean[sample]
+        boot_clip_balanced_mean = torch.nanmean(sampled_cluster_means, dim=1)
+        boot_clip_balanced_mean[boot_count < min_count] = torch.nan
         alpha = (1.0 - ci_level) / 2.0
         ci_low = torch.nanquantile(boot_mean, alpha, dim=0)
         ci_high = torch.nanquantile(boot_mean, 1.0 - alpha, dim=0)
+        clip_balanced_ci_low = torch.nanquantile(boot_clip_balanced_mean, alpha, dim=0)
+        clip_balanced_ci_high = torch.nanquantile(boot_clip_balanced_mean, 1.0 - alpha, dim=0)
         ci_low[~supported] = torch.nan
         ci_high[~supported] = torch.nan
+        clip_balanced_ci_low[~supported] = torch.nan
+        clip_balanced_ci_high[~supported] = torch.nan
     return {"bin_left": edges[:-1], "bin_right": edges[1:],
             "bin_center": (edges[:-1] + edges[1:]) / 2, "mean": mean,
             "ci_low": ci_low, "ci_high": ci_high, "count": total_count,
+            "sample_weighted_mean": mean, "sample_weighted_ci_low": ci_low,
+            "sample_weighted_ci_high": ci_high,
+            "clip_balanced_mean": clip_balanced_mean,
+            "clip_balanced_ci_low": clip_balanced_ci_low,
+            "clip_balanced_ci_high": clip_balanced_ci_high,
             "cluster_count": cluster_count, "supported": supported}
 
 
@@ -1622,7 +2008,7 @@ def analyze_tensor_clip(
     reactions = compute_reaction_metrics(
         continuous_response, onsets, geometry["predator_positions"], geometry["prey_positions"],
         response_threshold=response_threshold, response_window_steps=response_window_steps,
-        d_source=d_source,
+        response_lag=response_lag, d_source=d_source,
     )
     mean_nnd = geometry["prey_nnd"].mean(dim=1)
     polarization = compute_polarization_tensor(geometry["prey_headings"])
@@ -1748,7 +2134,9 @@ def analyze_case(
     per_clip: dict[str, list[torch.Tensor]] = {name: [] for name in scalar_names}
     event_names = ("reaction_latency", "reaction_distance", "reaction_distance_norm",
                    "response_fraction", "cascade_size", "cascade_fraction",
-                   "propagation_time", "mean_propagation_delay", "available_steps")
+                   "propagation_time", "mean_propagation_delay", "available_steps",
+                   "observed_responder_count", "confirmed_non_responder_count",
+                   "censored_count", "classification_denominator")
     event_results: dict[str, list[torch.Tensor]] = {name: [] for name in event_names}
     sensitivity_values = {float(t): {"fraction": [], "two_plus": [], "clips": set()}
                           for t in response_threshold_sensitivity}
@@ -1825,17 +2213,22 @@ def analyze_case(
             reactions = compute_reaction_metrics(
                 response, onsets, geometry["predator_positions"][idx], geometry["prey_positions"][idx],
                 response_threshold=response_threshold, response_window_steps=response_window_steps,
-                d_source=d_source)
+                response_lag=response_lag, d_source=d_source)
             clip_reactions.append(reactions)
             response_availability.append(reactions["availability"])
-            responding_events += int((reactions["cascade_size"] > 0).sum())
+            responding_events += int((reactions["observed_responder_count"] > 0).sum())
             for threshold in sensitivity_values:
                 sensitivity = (reactions if np.isclose(threshold, response_threshold) else
                     compute_reaction_metrics(
                         response, onsets, geometry["predator_positions"][idx], geometry["prey_positions"][idx],
-                        response_threshold=threshold, response_window_steps=response_window_steps))
+                        response_threshold=threshold, response_window_steps=response_window_steps,
+                        response_lag=response_lag))
                 sensitivity_values[threshold]["fraction"].append(sensitivity["response_fraction"])
-                sensitivity_values[threshold]["two_plus"].append(sensitivity["cascade_size"] >= 2)
+                complete_two_plus = torch.where(
+                    sensitivity["classification_complete"],
+                    (sensitivity["observed_responder_count"] >= 2).to(response.dtype),
+                    torch.nan)
+                sensitivity_values[threshold]["two_plus"].append(complete_two_plus)
                 if len(onsets): sensitivity_values[threshold]["clips"].add(clip["clip_id"])
         response_values = torch.cat(clip_response) if clip_response else normalized.new_empty(0)
         response_risk_values = torch.cat(clip_response_risk) if clip_response_risk else normalized.new_empty(0)
@@ -1881,6 +2274,12 @@ def analyze_case(
             curves[name] = {"bin_left": edges[:-1], "bin_right": edges[1:],
                             "bin_center": (edges[:-1] + edges[1:]) / 2,
                             "mean": empty, "ci_low": empty.clone(), "ci_high": empty.clone(),
+                            "sample_weighted_mean": empty.clone(),
+                            "sample_weighted_ci_low": empty.clone(),
+                            "sample_weighted_ci_high": empty.clone(),
+                            "clip_balanced_mean": empty.clone(),
+                            "clip_balanced_ci_low": empty.clone(),
+                            "clip_balanced_ci_high": empty.clone(),
                             "count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
                             "cluster_count": torch.zeros(len(empty), device=edges.device, dtype=torch.long),
                             "supported": torch.zeros(len(empty), device=edges.device, dtype=torch.bool)}
@@ -1902,11 +2301,11 @@ def analyze_case(
     sensitivity_summary = {}
     for threshold, values in sensitivity_values.items():
         fraction = torch.cat(values["fraction"]) if values["fraction"] else empty
-        two_plus = torch.cat(values["two_plus"]) if values["two_plus"] else torch.empty(0, dtype=torch.bool, device=edges.device)
+        two_plus = torch.cat(values["two_plus"]) if values["two_plus"] else empty
         sensitivity_summary[threshold] = {
             "events": len(fraction), "contributing_clips": len(values["clips"]),
             "mean_response_fraction": _nanmean_or_nan(fraction),
-            "fraction_events_two_plus": (two_plus.float().mean() if len(two_plus) else edges.new_tensor(torch.nan)),
+            "fraction_events_two_plus": _nanmean_or_nan(two_plus),
             "mean_cascade_fraction": _nanmean_or_nan(fraction),
         }
     diagnostics = dict(bundle["diagnostics"])
@@ -1959,10 +2358,16 @@ def compute_all_group_size_comparisons(
             set(analysis_results[key]["curves"]) for key in keys.values()
         ])
         for metric in curve_metrics:
-            source_output[f"{metric}_curve"] = compute_generalization_error(*[
-                analysis_results[keys[name]]["curves"][metric]["mean"]
-                for name in ("expert_16", "expert_32", "imitation_16", "imitation_32")
-            ])
+            sample_weighted = compute_generalization_error(*[
+                analysis_results[keys[name]]["curves"][metric]["sample_weighted_mean"]
+                for name in ("expert_16", "expert_32", "imitation_16", "imitation_32")])
+            clip_balanced = compute_generalization_error(*[
+                analysis_results[keys[name]]["curves"][metric]["clip_balanced_mean"]
+                for name in ("expert_16", "expert_32", "imitation_16", "imitation_32")])
+            # The historical curve key remains a sample-weighted alias.
+            source_output[f"{metric}_curve"] = sample_weighted
+            source_output[f"{metric}_curve_sample_weighted"] = sample_weighted
+            source_output[f"{metric}_curve_clip_balanced"] = clip_balanced
         output[source] = source_output
     return output
 
@@ -2158,7 +2563,8 @@ __all__ = [
     "angular_difference", "euclidean_distance", "prey_centroid",
     "predator_to_nearest_prey_distance", "focal_frame_transform", "vector_angle",
     "away_from_predator_direction", "heading_alignment", "frame_groups", "active_prey_filter",
-    "load_expert_32prey", "load_expert_trajectories", "load_policy_pair", "load_jannik_policy_pair",
+    "load_expert_32prey", "load_expert_trajectories", "load_biological_window_trajectories",
+    "load_policy_pair", "load_jannik_policy_pair",
     "generate_policy_rollouts", "generate_couzin_expert_rollouts", "trajectory_diagnostics",
     "compute_prey_nnd", "compute_polarization", "compute_escape_alignment",
     "compute_risk_conditioned_metrics", "make_bin_edges", "binned_cluster_summary",
