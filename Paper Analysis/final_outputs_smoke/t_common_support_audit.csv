@@ -1,0 +1,17 @@
+metric,source,case,T_common_step,T_common_time,case_last_supported_step,required_clips,complete_prefix_clips,original_clips,complete_prefix_fraction
+dos,couzin,couzin_expert_16,34,17.0,34,1,1,1,1.0
+dos,couzin,couzin_expert_32,34,17.0,34,1,1,1,1.0
+dos,couzin,couzin_imitation_16,34,17.0,34,1,1,1,1.0
+dos,couzin,couzin_imitation_32,34,17.0,34,1,1,1,1.0
+dos,biological,bio_expert_16,34,2.2666666666666666,186,4,8,8,1.0
+dos,biological,bio_expert_32,34,2.2666666666666666,213,18,32,35,0.9142857193946838
+dos,biological,bio_imitation_16,34,2.2666666666666666,34,1,1,1,1.0
+dos,biological,bio_imitation_32,34,2.2666666666666666,34,1,1,1,1.0
+doa,couzin,couzin_expert_16,34,17.0,34,1,1,1,1.0
+doa,couzin,couzin_expert_32,34,17.0,34,1,1,1,1.0
+doa,couzin,couzin_imitation_16,34,17.0,34,1,1,1,1.0
+doa,couzin,couzin_imitation_32,34,17.0,34,1,1,1,1.0
+doa,biological,bio_expert_16,34,2.2666666666666666,186,4,8,8,1.0
+doa,biological,bio_expert_32,34,2.2666666666666666,213,18,32,35,0.9142857193946838
+doa,biological,bio_imitation_16,34,2.2666666666666666,34,1,1,1,1.0
+doa,biological,bio_imitation_32,34,2.2666666666666666,34,1,1,1,1.0
