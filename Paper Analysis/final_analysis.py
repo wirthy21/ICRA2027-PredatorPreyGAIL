@@ -81,6 +81,11 @@ SOURCE_PREFIX = {"couzin": "couzin", "biological": "bio"}
 KIND_LABEL = {"expert": "Data", "imitation": "GAIL imitation"}
 KIND_COLOR = {"expert": "#2563A6", "imitation": "#E2762D"}
 SIZE_MARKER = {16: "o", 32: "s"}
+BEHAVIOR_METRICS = tuple(METRIC_SPECS)[:4]
+CATEGORY_METRICS = {
+    "Predator": BEHAVIOR_METRICS[:2],
+    "Prey": BEHAVIOR_METRICS[2:],
+}
 
 
 def _finite_1d(values: Any) -> torch.Tensor:
@@ -547,41 +552,67 @@ def set_paper_style() -> None:
     })
 
 
-def plot_source_overview(final_results: Mapping[str, Any], source: str) -> Any:
-    """Six-panel Data-versus-GAIL overview, identical for stages 1 and 2."""
+def plot_source_overview(
+    final_results: Mapping[str, Any], source: str, category: str,
+) -> Any:
+    """Compact two-panel clip distributions for one response category."""
 
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     set_paper_style()
+    if category not in CATEGORY_METRICS:
+        raise ValueError(f"category must be one of {tuple(CATEGORY_METRICS)}")
     prefix = SOURCE_PREFIX[source]
-    fig, axes = plt.subplots(3, 2, figsize=(7.2, 8.1))
-    for ax, (metric, spec) in zip(axes.flat, METRIC_SPECS.items()):
-        for kind in ("expert", "imitation"):
-            means, low, high = [], [], []
-            for n_prey in (16, 32):
-                summary = final_results["summary"][f"{prefix}_{kind}_{n_prey}"][metric]
-                means.append(summary["mean"]); low.append(summary["ci_low"]); high.append(summary["ci_high"])
-            means = np.asarray(means)
-            low, high = np.asarray(low), np.asarray(high)
-            errors = np.vstack((means - low, high - means))
-            ax.errorbar(
-                (16, 32), means, yerr=errors, color=KIND_COLOR[kind], marker="o",
-                linewidth=1.6, capsize=3, label=KIND_LABEL[kind],
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.65))
+    positions = {
+        (16, "expert"): 0.82, (16, "imitation"): 1.18,
+        (32, "expert"): 1.82, (32, "imitation"): 2.18,
+    }
+    for metric_index, (ax, metric) in enumerate(zip(axes.flat, CATEGORY_METRICS[category])):
+        spec = METRIC_SPECS[metric]
+        for group_index, (n_prey, kind) in enumerate(
+            (pair for n in (16, 32) for pair in ((n, "expert"), (n, "imitation")))
+        ):
+            case = f"{prefix}_{kind}_{n_prey}"
+            values = _finite_1d(final_results["per_clip"][case][metric]).numpy()
+            position = positions[(n_prey, kind)]
+            if not len(values):
+                continue
+            box = ax.boxplot(
+                [values], positions=[position], widths=0.28, patch_artist=True,
+                showfliers=False, whis=1.5, manage_ticks=False,
+                medianprops={"color": "white", "linewidth": 1.5},
+                boxprops={"edgecolor": KIND_COLOR[kind], "linewidth": 1.1},
+                whiskerprops={"color": KIND_COLOR[kind], "linewidth": 1.0},
+                capprops={"color": KIND_COLOR[kind], "linewidth": 1.0},
             )
-        ax.set_title(f"{spec['category']} | {spec['short_label']}")
-        ax.set_xlabel("Group size"); ax.set_ylabel(spec["unit"]); ax.set_xticks((16, 32))
+            box["boxes"][0].set_facecolor(KIND_COLOR[kind])
+            box["boxes"][0].set_alpha(0.78)
+
+            # Every independent clip remains visible; jitter is deterministic.
+            rng = np.random.default_rng(2027 + 100 * metric_index + group_index)
+            jitter = rng.uniform(-0.055, 0.055, size=len(values))
+            ax.scatter(
+                np.full(len(values), position) + jitter, values, s=10,
+                color=KIND_COLOR[kind], alpha=0.38, edgecolors="none", zorder=3,
+            )
+        ax.set_title(spec["short_label"])
+        ax.set_xlabel("Group size")
+        ax.set_ylabel(spec["unit"])
+        ax.set_xticks((1, 2), labels=("16", "32"))
+        ax.set_xlim(0.55, 2.45)
         ax.axhline(0, color="0.45", linewidth=0.7, zorder=0) if metric != "predator_distance" else None
-    handles, labels = axes.flat[0].get_legend_handles_labels()
+    handles = [
+        Patch(facecolor=KIND_COLOR[kind], edgecolor=KIND_COLOR[kind], alpha=0.78,
+              label=KIND_LABEL[kind])
+        for kind in ("expert", "imitation")
+    ]
     fig.legend(
-        handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955),
+        handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.005),
         ncol=2, frameon=False,
     )
-    fig.suptitle(
-        "Couzin data vs. Couzin GAIL imitation" if source == "couzin"
-        else "Biological data vs. Biological GAIL imitation",
-        fontsize=12, y=0.995,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.90), h_pad=2.0, w_pad=1.8)
+    fig.tight_layout(rect=(0, 0.18, 1, 1), w_pad=1.4)
     return fig
 
 
@@ -591,7 +622,7 @@ def plot_collective_timeline(final_results: Mapping[str, Any], source: str) -> A
     import matplotlib.pyplot as plt
 
     set_paper_style()
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.6))
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.75))
     for ax, metric in zip(axes, ("dos", "doa")):
         block = final_results["collective"][metric][source]
         x = block["time"].numpy()
@@ -604,32 +635,32 @@ def plot_collective_timeline(final_results: Mapping[str, Any], source: str) -> A
                     linewidth=1.5, label=label)
             ax.fill_between(x, values["ci_low"], values["ci_high"],
                             color=KIND_COLOR[kind], alpha=0.10, linewidth=0)
-        ax.set_title(METRIC_SPECS[metric]["short_label"])
+        ax.set_title("Degree of Swarm (DoS)" if metric == "dos" else "Degree of Alignment (DoA)")
         ax.set_xlabel("Time [s]" if source == "biological" else "Couzin simulation time")
         ax.set_ylabel(METRIC_SPECS[metric]["unit"])
         ax.set_xlim(float(x[0]), float(x[-1]))
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
-        handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.90),
+        handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.005),
         ncol=4, frameon=False,
     )
-    fig.suptitle(
-        f"Fixed complete-prefix cohort through T-common "
-        f"({final_results['collective']['dos'][source]['t_common']} steps)",
-        fontsize=10, y=0.985,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.78), w_pad=2.0)
+    fig.tight_layout(rect=(0, 0.20, 1, 1), w_pad=1.4)
     return fig
 
 
-def plot_population_consistency(final_results: Mapping[str, Any]) -> Any:
-    """Six-panel Bio group-size shifts for data and imitation."""
+def plot_population_consistency(
+    final_results: Mapping[str, Any], category: str,
+) -> Any:
+    """Compact two-panel Bio group-size shifts for one response category."""
 
     import matplotlib.pyplot as plt
 
     set_paper_style()
-    fig, axes = plt.subplots(3, 2, figsize=(7.2, 8.1))
-    for ax, (metric, spec) in zip(axes.flat, METRIC_SPECS.items()):
+    if category not in CATEGORY_METRICS:
+        raise ValueError(f"category must be one of {tuple(CATEGORY_METRICS)}")
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.65))
+    for ax, metric in zip(axes.flat, CATEGORY_METRICS[category]):
+        spec = METRIC_SPECS[metric]
         for kind in ("expert", "imitation"):
             values = []
             errors_low, errors_high = [], []
@@ -643,16 +674,15 @@ def plot_population_consistency(final_results: Mapping[str, Any]) -> Any:
                 color=KIND_COLOR[kind], marker="o", linewidth=1.6, capsize=3,
                 label=KIND_LABEL[kind],
             )
-        ax.set_title(f"{spec['category']} | {spec['short_label']}")
+        ax.set_title(spec["short_label"])
         ax.set_xlabel("Biological group size"); ax.set_ylabel(spec["unit"]); ax.set_xticks((16, 32))
         ax.axhline(0, color="0.45", linewidth=0.7, zorder=0) if metric != "predator_distance" else None
     handles, labels = axes.flat[0].get_legend_handles_labels()
     fig.legend(
-        handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955),
+        handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.005),
         ncol=2, frameon=False,
     )
-    fig.suptitle("Biological N=16 vs. N=32 consistency/sensitivity", fontsize=12, y=0.995)
-    fig.tight_layout(rect=(0, 0, 1, 0.90), h_pad=2.0, w_pad=1.8)
+    fig.tight_layout(rect=(0, 0.18, 1, 1), w_pad=1.4)
     return fig
 
 
