@@ -630,18 +630,25 @@ def extract_approach_windows(
     pre_steps: int = 5,
     distance_threshold: float = 0.15,
     closing_lag: int = 3,
+    exit_threshold: float = 0.165,
+    min_duration: int = 2,
+    cooldown_steps: int = 20,
+    min_event_step: int = 0,
     one_window_per_rollout: bool = True,
 ) -> tuple[pa.TrajectoryTable, pd.DataFrame]:
     """Extract fixed Couzin windows around objectively detected approaches.
 
-    A candidate must be within the declared normalized-distance threshold,
-    closer than ``closing_lag`` steps earlier, and retain the same nearest prey.
-    Selecting at most one window per source rollout keeps boxplot observations
-    independent even though training may later oversample more windows.
+    Event onsets come from the same robust detector used by ``analyze_trajectory``:
+    threshold plus closing trend, target persistence, minimum duration,
+    hysteresis, and cooldown.  Selecting at most one window per source rollout
+    keeps boxplot observations independent even though training may later
+    oversample more windows.
     """
 
     if window_steps < 2 or pre_steps < 0 or pre_steps >= window_steps:
         raise ValueError("Require window_steps >= 2 and 0 <= pre_steps < window_steps")
+    if min_event_step < 0:
+        raise ValueError("min_event_step must be non-negative")
     bundle = pa.trajectory_table_to_metric_segments(
         table, expected_n_prey=n_prey, device="cpu", dtype=torch.float32)
     selections: list[dict[str, Any]] = []
@@ -650,16 +657,19 @@ def extract_approach_windows(
             clip, d_source=math.hypot(50.0, 50.0), device="cpu", dtype=torch.float32)
         _, distance = pa.compute_predator_nearest_distance(geometry)
         target = geometry["nearest_prey_index"]
+        detected = pa.detect_approach_events(
+            distance, threshold=distance_threshold, closing_lag=closing_lag,
+            exit_threshold=exit_threshold, min_duration=min_duration,
+            cooldown_steps=cooldown_steps, target_index=target,
+            require_target_persistence=True)
         candidates = []
-        for index in range(max(pre_steps, closing_lag), len(distance)):
+        for index_tensor in detected:
+            index = int(index_tensor)
             start = index - pre_steps
             stop = start + window_steps
-            if stop > len(distance):
+            if index < max(pre_steps, min_event_step) or stop > len(distance):
                 continue
-            closing = bool(distance[index] < distance[index - closing_lag])
-            persistent = bool(target[index] == target[index - closing_lag])
-            if float(distance[index]) <= distance_threshold and closing and persistent:
-                candidates.append(index)
+            candidates.append(index)
         if not candidates:
             continue
         chosen = candidates[:1] if one_window_per_rollout else candidates[::window_steps]
@@ -671,6 +681,7 @@ def extract_approach_windows(
                 "start_time": float(clip["time_steps"][start]),
                 "stop_time": float(clip["time_steps"][stop - 1]),
                 "approach_time": float(clip["time_steps"][index]),
+                "approach_index": int(index),
                 "approach_distance": float(distance[index]),
             })
     if not selections:
@@ -687,7 +698,7 @@ def extract_approach_windows(
         for name, values in table.columns.items():
             value = values[rows].copy()
             if name == "clip_id":
-                value[:] = selection["window_id"]
+                value = np.full(len(rows), selection["window_id"], dtype=object)
             elif name in {"frame", "time_step"}:
                 value = value.astype(float) - selection["start_time"]
             elif name == "timestamp":
@@ -700,6 +711,211 @@ def extract_approach_windows(
         name: np.concatenate(values) for name, values in parts.items()
     })
     return window_table, pd.DataFrame(selections)
+
+
+def _select_clips(
+    table: pa.TrajectoryTable, clip_ids: Sequence[str],
+) -> pa.TrajectoryTable:
+    """Select complete clips while preserving table columns and row order."""
+
+    wanted = {str(value) for value in clip_ids}
+    mask = np.asarray([str(value) in wanted for value in table["clip_id"]], dtype=bool)
+    return pa.TrajectoryTable({
+        name: values[mask].copy() for name, values in table.columns.items()
+    })
+
+
+def truncate_trajectory_windows(
+    table: pa.TrajectoryTable, window_steps: int,
+) -> pa.TrajectoryTable:
+    """Keep the first ``window_steps`` recorded states of every matched clip."""
+
+    if window_steps < 2:
+        raise ValueError("window_steps must be at least two")
+    mask = np.zeros(len(table), dtype=bool)
+    clip_values = table["clip_id"].astype(str)
+    for clip_id in dict.fromkeys(clip_values):
+        clip_rows = np.where(clip_values == clip_id)[0]
+        times = np.unique(table["time_step"][clip_rows].astype(float))
+        if len(times) < window_steps:
+            raise ValueError(f"Clip {clip_id!r} has fewer than {window_steps} states")
+        keep_times = set(times[:window_steps].tolist())
+        mask[clip_rows] = np.asarray([
+            float(value) in keep_times for value in table["time_step"][clip_rows]
+        ])
+    return pa.TrajectoryTable({
+        name: values[mask].copy() for name, values in table.columns.items()
+    })
+
+
+def collect_independent_approach_windows(
+    spec: VariantSpec = TRAINING_MATCHED,
+    *,
+    n_prey: int,
+    target_windows: int = 40,
+    minimum_windows: int = 30,
+    max_source_rollouts: int = 120,
+    batch_size: int = 10,
+    source_steps: int = 300,
+    window_steps: int = 80,
+    burn_in_steps: int = 50,
+    base_seed: int = 2027,
+) -> tuple[pa.TrajectoryTable, pd.DataFrame, pd.DataFrame]:
+    """Adaptively collect one valid approach window per independent rollout.
+
+    Source rollouts are generated from distinct simulation seeds.  A rollout is
+    accepted only when the robust detector finds an event after burn-in with a
+    complete maximum-horizon future.  At most its first valid event is retained.
+    """
+
+    if not (1 <= minimum_windows <= target_windows <= max_source_rollouts):
+        raise ValueError(
+            "Require 1 <= minimum_windows <= target_windows <= max_source_rollouts")
+    if batch_size < 1 or source_steps < window_steps + burn_in_steps:
+        raise ValueError("Invalid batch size or insufficient source horizon")
+
+    source_spec = replace(spec, rollout_steps=source_steps)
+    accepted_windows: list[pa.TrajectoryTable] = []
+    event_audits: list[pd.DataFrame] = []
+    source_rows: list[dict[str, Any]] = []
+    attempted = accepted = 0
+
+    while accepted < target_windows and attempted < max_source_rollouts:
+        count = min(batch_size, max_source_rollouts - attempted)
+        seeds = tuple(
+            int(base_seed + n_prey * 100_000 + attempted + offset)
+            for offset in range(count)
+        )
+        batch = generate_couzin_expert_rollouts(
+            source_spec, n_prey=n_prey, n_rollouts=1, rollout_seeds=seeds)
+        batch_clip_ids = list(dict.fromkeys(batch["clip_id"].astype(str)))
+        try:
+            windows, audit = extract_approach_windows(
+                batch, n_prey=n_prey, window_steps=window_steps, pre_steps=0,
+                min_event_step=burn_in_steps, one_window_per_rollout=True)
+        except ValueError:
+            windows, audit = None, pd.DataFrame()
+
+        accepted_ids = set() if audit.empty else set(audit["source_clip_id"].astype(str))
+        remaining = target_windows - accepted
+        chosen_ids = list(dict.fromkeys(
+            audit["source_clip_id"].astype(str).tolist()))[:remaining] if not audit.empty else []
+        chosen = set(chosen_ids)
+        if chosen_ids:
+            chosen_audit = audit[audit["source_clip_id"].astype(str).isin(chosen)].copy()
+            accepted_windows.append(_select_clips(windows, chosen_audit["window_id"].astype(str)))
+            event_audits.append(chosen_audit)
+            accepted += len(chosen_ids)
+
+        audit_by_source = (
+            audit.set_index("source_clip_id").to_dict("index") if not audit.empty else {})
+        for clip_id in batch_clip_ids:
+            event = audit_by_source.get(clip_id, {})
+            source_rows.append({
+                "n_prey": int(n_prey), "source_clip_id": clip_id,
+                "source_seed": int(clip_id.split("_rollout_")[0].replace("seed_", "")),
+                "valid_event_found": clip_id in accepted_ids,
+                "selected": clip_id in chosen,
+                "approach_index": event.get("approach_index", np.nan),
+                "approach_distance": event.get("approach_distance", np.nan),
+            })
+        attempted += count
+
+    if not accepted_windows:
+        raise ValueError(
+            f"No valid N={n_prey} approach events found in {attempted} independent rollouts")
+    windows = pa.concatenate_trajectory_tables(accepted_windows)
+    event_audit = pd.concat(event_audits, ignore_index=True)
+    source_audit = pd.DataFrame(source_rows)
+    source_audit.attrs.update({
+        "target_windows": target_windows,
+        "minimum_windows": minimum_windows,
+        "minimum_reached": accepted >= minimum_windows,
+        "selected_windows": accepted,
+        "attempted_rollouts": attempted,
+    })
+    return windows, event_audit, source_audit
+
+
+def evaluate_large_approach_cohort(
+    spec: VariantSpec = TRAINING_MATCHED,
+    *,
+    group_sizes: Sequence[int] = (16, 32),
+    horizons: Sequence[int] = (20, 40, 80),
+    target_windows: int = 40,
+    minimum_windows: int = 30,
+    max_source_rollouts: int = 120,
+    batch_size: int = 10,
+    source_steps: int = 300,
+    burn_in_steps: int = 50,
+    base_seed: int = 2027,
+) -> tuple[dict[int, dict[str, Any]], pd.DataFrame]:
+    """Evaluate nested horizons on one large independent event cohort.
+
+    Every group uses one event per source rollout.  Couzin and GAIL start at the
+    identical event state, and the same 80-step Couzin/GAIL realization is
+    truncated to each requested horizon so horizon differences are paired.
+    """
+
+    horizons = tuple(sorted({int(value) for value in horizons}))
+    if not horizons or horizons[0] < 2:
+        raise ValueError("At least one horizon of two or more steps is required")
+    maximum = max(horizons)
+    collected: dict[int, dict[str, Any]] = {}
+    summary_rows: list[dict[str, Any]] = []
+    for n_prey in group_sizes:
+        expert_max, event_audit, source_audit = collect_independent_approach_windows(
+            spec, n_prey=n_prey, target_windows=target_windows,
+            minimum_windows=minimum_windows, max_source_rollouts=max_source_rollouts,
+            batch_size=batch_size, source_steps=source_steps,
+            window_steps=maximum, burn_in_steps=burn_in_steps,
+            base_seed=base_seed)
+        starts, clip_ids = _initial_states(expert_max, n_prey)
+        max_spec = replace(spec, rollout_steps=maximum)
+        imitation_max = generate_policy_rollouts(
+            max_spec, n_prey=n_prey, initial_states=starts, clip_ids=clip_ids,
+            seed=base_seed + 900_000 + n_prey)
+        collected[n_prey] = {
+            "expert": expert_max, "imitation": imitation_max,
+            "window_audit": event_audit, "source_audit": source_audit,
+        }
+        selected = int(source_audit["selected"].sum())
+        attempted = len(source_audit)
+        summary_rows.append({
+            "n_prey": int(n_prey), "target_windows": int(target_windows),
+            "minimum_windows": int(minimum_windows), "selected_windows": selected,
+            "source_rollouts_attempted": attempted,
+            "source_rollouts_with_valid_event": int(source_audit["valid_event_found"].sum()),
+            "acceptance_rate": selected / attempted,
+            "minimum_reached": bool(selected >= minimum_windows),
+            "unique_source_rollouts": int(event_audit["source_clip_id"].nunique()),
+            "mean_onset_distance": float(event_audit["approach_distance"].mean()),
+        })
+
+    results: dict[int, dict[str, Any]] = {}
+    for horizon in horizons:
+        horizon_spec = replace(
+            spec, name=f"large_independent_approach_{horizon}",
+            label=f"Large independent approach cohort, {horizon} steps",
+            explanation=(
+                "One robustly detected post-burn-in event per independent Couzin "
+                f"rollout; exact matched event states and a paired {horizon}-step horizon."),
+            rollout_steps=horizon)
+        result: dict[str, Any] = {"spec": horizon_spec, "groups": {}}
+        for n_prey in group_sizes:
+            expert = truncate_trajectory_windows(collected[n_prey]["expert"], horizon)
+            imitation = truncate_trajectory_windows(collected[n_prey]["imitation"], horizon)
+            result["groups"][n_prey] = {
+                "expert": expert, "imitation": imitation,
+                "window_audit": collected[n_prey]["window_audit"].copy(),
+                "source_audit": collected[n_prey]["source_audit"].copy(),
+                "expert_analysis": analyze_trajectory(
+                    expert, n_prey=n_prey, step_duration=spec.dt),
+                "imitation_analysis": analyze_trajectory(
+                    imitation, n_prey=n_prey, step_duration=spec.dt),
+            }
+        results[horizon] = result
+    return results, pd.DataFrame(summary_rows)
 
 
 def evaluate_approach_variant(
@@ -970,6 +1186,46 @@ def plot_collective_timelines(result: Mapping[str, Any]) -> Any:
     return fig
 
 
+def plot_expert_collective_timelines(result: Mapping[str, Any]) -> Any:
+    """Plot expert-only DoS/DoA for the Couzin data behind an analysis."""
+
+    import matplotlib.pyplot as plt
+
+    fa.set_paper_style()
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.75))
+    colors = {16: "#2563A6", 32: "#6F4E9C"}
+    is_event_window = "approach" in result["spec"].name
+    for metric_index, (ax, metric) in enumerate(zip(axes, ("dos", "doa"))):
+        for n_prey in (16, 32):
+            timelines = result["groups"][n_prey]["expert_analysis"][f"{metric}_timeline"]
+            width = min(len(value) for value in timelines)
+            matrix = torch.stack([value[:width].float().cpu() for value in timelines])
+            mean = matrix.mean(dim=0)
+            if len(matrix) > 1:
+                generator = torch.Generator(device="cpu").manual_seed(
+                    31_337 + 100 * metric_index + n_prey)
+                index = torch.randint(len(matrix), (1000, len(matrix)), generator=generator)
+                draws = matrix[index].mean(dim=1)
+                low, high = torch.quantile(
+                    draws, torch.tensor([0.025, 0.975]), dim=0)
+            else:
+                low = high = mean
+            x = np.arange(width) * result["spec"].dt
+            ax.plot(x, mean, color=colors[n_prey], linewidth=1.6,
+                    label=f"Couzin, N={n_prey}")
+            ax.fill_between(x, low, high, color=colors[n_prey], alpha=0.14, linewidth=0)
+        ax.set_title("Couzin Degree of Swarm (DoS)" if metric == "dos"
+                     else "Couzin Degree of Alignment (DoA)")
+        ax.set_xlabel("Time from approach onset" if is_event_window
+                      else "Couzin simulation time")
+        ax.set_ylabel(fa.METRIC_SPECS[metric]["unit"])
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.005),
+               ncol=2, frameon=False)
+    fig.tight_layout(rect=(0, 0.20, 1, 1), w_pad=1.4)
+    return fig
+
+
 def save_variant_artifacts(
     result: Mapping[str, Any], output_dir: str | Path,
 ) -> list[Path]:
@@ -993,6 +1249,10 @@ def save_variant_artifacts(
     pdf, png = fa.save_figure(fig, output_dir / f"{name}_collective_timeline")
     paths.extend((pdf, png))
     plt.close(fig)
+    fig = plot_expert_collective_timelines(result)
+    pdf, png = fa.save_figure(fig, output_dir / f"{name}_couzin_dos_doa")
+    paths.extend((pdf, png))
+    plt.close(fig)
     return paths
 
 
@@ -1000,10 +1260,12 @@ __all__ = [
     "VariantSpec", "CURRENT_PAPER", "TRAINING_MATCHED", "default_screening_variants",
     "noise_variants", "load_policy_pair", "generate_couzin_expert_rollouts",
     "generate_policy_rollouts", "analyze_trajectory", "extract_approach_windows",
+    "truncate_trajectory_windows", "collect_independent_approach_windows",
     "build_supervised_transition_data", "supervised_repair",
     "combine_supervised_data",
-    "evaluate_approach_variant", "evaluate_variant", "evaluate_variants",
+    "evaluate_approach_variant", "evaluate_large_approach_cohort",
+    "evaluate_variant", "evaluate_variants",
     "result_rows", "provenance_audit", "quality_gate", "plot_behavior_boxplots",
-    "plot_collective_timelines",
+    "plot_collective_timelines", "plot_expert_collective_timelines",
     "save_variant_artifacts",
 ]
