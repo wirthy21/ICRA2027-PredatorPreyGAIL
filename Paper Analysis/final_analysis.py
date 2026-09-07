@@ -412,78 +412,6 @@ def stage_imitation_table(
     return rows
 
 
-def stage_population_table(final_results: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Rows for the Bio N=16 versus N=32 consistency/sensitivity comparison."""
-
-    settings = final_results["settings"]
-    rows: list[dict[str, Any]] = []
-    for category in ("Predator", "Prey", "Collective"):
-        for metric, spec in METRIC_SPECS.items():
-            if spec["category"] != category:
-                continue
-            values = {
-                key: final_results["per_clip"][f"bio_{kind}_{n}"][metric]
-                for key, kind, n in (
-                    ("data16", "expert", 16), ("data32", "expert", 32),
-                    ("gail16", "imitation", 16), ("gail32", "imitation", 32),
-                )
-            }
-            summaries = {
-                key: final_results["summary"][f"bio_{kind}_{n}"][metric]
-                for key, kind, n in (
-                    ("data16", "expert", 16), ("data32", "expert", 32),
-                    ("gail16", "imitation", 16), ("gail32", "imitation", 32),
-                )
-            }
-            row_seed = settings["seed"] + 20000 + len(rows) * 10
-            delta_data = _difference_summary(
-                values["data16"], values["data32"], n_bootstrap=settings["n_bootstrap"],
-                ci_level=settings["ci_level"], seed=row_seed,
-            )
-            delta_gail = _difference_summary(
-                values["gail16"], values["gail32"], n_bootstrap=settings["n_bootstrap"],
-                ci_level=settings["ci_level"], seed=row_seed + 2,
-            )
-
-            # Joint independent-clip bootstrap for (delta_GAIL - delta_Data).
-            draws = {}
-            for offset, key in enumerate(("data16", "data32", "gail16", "gail32")):
-                _, draws[key] = _bootstrap_means(
-                    values[key], n_bootstrap=settings["n_bootstrap"], seed=row_seed + 4 + offset,
-                )
-            consistency = delta_gail["difference"] - delta_data["difference"]
-            consistency_draws = (
-                draws["gail32"] - draws["gail16"]
-                - (draws["data32"] - draws["data16"])
-            )
-            alpha = (1.0 - settings["ci_level"]) / 2.0
-            quantiles = torch.tensor(
-                [alpha, 1.0 - alpha], dtype=consistency_draws.dtype,
-            )
-            consistency_low, consistency_high = torch.quantile(
-                consistency_draws, quantiles,
-            ).tolist()
-            rows.append({
-                "category": category,
-                "metric": spec["label"],
-                "data_16_mean": summaries["data16"]["mean"],
-                "data_32_mean": summaries["data32"]["mean"],
-                "delta_data_32_minus_16": delta_data["difference"],
-                "delta_data_ci_low": delta_data["ci_low"],
-                "delta_data_ci_high": delta_data["ci_high"],
-                "gail_16_mean": summaries["gail16"]["mean"],
-                "gail_32_mean": summaries["gail32"]["mean"],
-                "delta_gail_32_minus_16": delta_gail["difference"],
-                "delta_gail_ci_low": delta_gail["ci_low"],
-                "delta_gail_ci_high": delta_gail["ci_high"],
-                "consistency_error": consistency,
-                "consistency_ci_low": float(consistency_low),
-                "consistency_ci_high": float(consistency_high),
-                "absolute_consistency_error": abs(consistency),
-            })
-    return rows
-
-
 def paper_imitation_table(rows: Sequence[Mapping[str, Any]]) -> Any:
     """Compact formatted DataFrame intended for direct paper transcription."""
 
@@ -503,34 +431,6 @@ def paper_imitation_table(rows: Sequence[Mapping[str, Any]]) -> Any:
         ),
         "Absolute error": f"{row['absolute_imitation_error']:.3f}",
         "Clips Data/GAIL": f"{row['data_n']}/{row['gail_n']}",
-    } for row in rows])
-
-
-def paper_population_table(rows: Sequence[Mapping[str, Any]]) -> Any:
-    """Compact formatted DataFrame for the Bio 16/32 consistency table."""
-
-    import pandas as pd
-
-    def interval(mean: float, low: float, high: float) -> str:
-        return f"{mean:.3f} [{low:.3f}, {high:.3f}]"
-
-    return pd.DataFrame([{
-        "Category": row["category"],
-        "Metric": row["metric"],
-        "Data 16": f"{row['data_16_mean']:.3f}",
-        "Data 32": f"{row['data_32_mean']:.3f}",
-        "Delta Data": interval(
-            row["delta_data_32_minus_16"], row["delta_data_ci_low"], row["delta_data_ci_high"],
-        ),
-        "GAIL 16": f"{row['gail_16_mean']:.3f}",
-        "GAIL 32": f"{row['gail_32_mean']:.3f}",
-        "Delta GAIL": interval(
-            row["delta_gail_32_minus_16"], row["delta_gail_ci_low"], row["delta_gail_ci_high"],
-        ),
-        "Consistency error": interval(
-            row["consistency_error"], row["consistency_ci_low"], row["consistency_ci_high"],
-        ),
-        "Absolute consistency error": f"{row['absolute_consistency_error']:.3f}",
     } for row in rows])
 
 
@@ -648,44 +548,6 @@ def plot_collective_timeline(final_results: Mapping[str, Any], source: str) -> A
     return fig
 
 
-def plot_population_consistency(
-    final_results: Mapping[str, Any], category: str,
-) -> Any:
-    """Compact two-panel Bio group-size shifts for one response category."""
-
-    import matplotlib.pyplot as plt
-
-    set_paper_style()
-    if category not in CATEGORY_METRICS:
-        raise ValueError(f"category must be one of {tuple(CATEGORY_METRICS)}")
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.65))
-    for ax, metric in zip(axes.flat, CATEGORY_METRICS[category]):
-        spec = METRIC_SPECS[metric]
-        for kind in ("expert", "imitation"):
-            values = []
-            errors_low, errors_high = [], []
-            for n_prey in (16, 32):
-                summary = final_results["summary"][f"bio_{kind}_{n_prey}"][metric]
-                values.append(summary["mean"])
-                errors_low.append(summary["mean"] - summary["ci_low"])
-                errors_high.append(summary["ci_high"] - summary["mean"])
-            ax.errorbar(
-                (16, 32), values, yerr=np.vstack((errors_low, errors_high)),
-                color=KIND_COLOR[kind], marker="o", linewidth=1.6, capsize=3,
-                label=KIND_LABEL[kind],
-            )
-        ax.set_title(spec["short_label"])
-        ax.set_xlabel("Biological group size"); ax.set_ylabel(spec["unit"]); ax.set_xticks((16, 32))
-        ax.axhline(0, color="0.45", linewidth=0.7, zorder=0) if metric != "predator_distance" else None
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(
-        handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.005),
-        ncol=2, frameon=False,
-    )
-    fig.tight_layout(rect=(0, 0.18, 1, 1), w_pad=1.4)
-    return fig
-
-
 def save_figure(fig: Any, output_stem: str | Path) -> tuple[Path, Path]:
     """Save a figure as vector PDF and high-resolution PNG."""
 
@@ -710,7 +572,6 @@ def save_table_artifacts(table: Any, output_stem: str | Path) -> tuple[Path, Pat
 
 __all__ = [
     "METRIC_SPECS", "SOURCE_CASES", "build_final_results", "summarize_values",
-    "stage_imitation_table", "stage_population_table", "paper_imitation_table",
-    "paper_population_table", "plot_source_overview", "plot_collective_timeline",
-    "plot_population_consistency", "save_figure", "save_table_artifacts",
+    "stage_imitation_table", "paper_imitation_table", "plot_source_overview",
+    "plot_collective_timeline", "save_figure", "save_table_artifacts",
 ]
