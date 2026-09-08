@@ -1155,11 +1155,9 @@ def plot_collective_timelines(result: Mapping[str, Any]) -> Any:
 
     fa.set_paper_style()
     fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.75))
-    colors = {"expert": "#2563A6", "imitation": "#E2762D"}
-    labels = {"expert": "Data", "imitation": "GAIL imitation"}
     for ax, metric in zip(axes, ("dos", "doa")):
-        for n_prey in (16, 32):
-            for kind in ("expert", "imitation"):
+        for kind in ("expert", "imitation"):
+            for n_prey in (16, 32):
                 timelines = result["groups"][n_prey][f"{kind}_analysis"][f"{metric}_timeline"]
                 width = min(len(value) for value in timelines)
                 matrix = torch.stack([value[:width].float().cpu() for value in timelines])
@@ -1173,55 +1171,17 @@ def plot_collective_timelines(result: Mapping[str, Any]) -> Any:
                     low = high = mean
                 x = np.arange(width) * result["spec"].dt
                 linestyle = "-" if n_prey == 16 else "--"
-                ax.plot(x, mean, color=colors[kind], linestyle=linestyle,
-                        linewidth=1.5, label=f"{labels[kind]}, N={n_prey}")
-                ax.fill_between(x, low, high, color=colors[kind], alpha=0.10, linewidth=0)
+                ax.plot(x, mean, color=fa.KIND_COLOR[kind], linestyle=linestyle,
+                        linewidth=1.5, label=f"{fa.KIND_LABEL[kind]}, N={n_prey}")
+                ax.fill_between(
+                    x, low, high, color=fa.KIND_COLOR[kind], alpha=0.10, linewidth=0)
         ax.set_title("Degree of Swarm (DoS)" if metric == "dos" else "Degree of Alignment (DoA)")
         ax.set_xlabel("Couzin simulation time")
         ax.set_ylabel(fa.METRIC_SPECS[metric]["unit"])
+        ax.set_xlim(float(x[0]), float(x[-1]))
     handles, legend_labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, legend_labels, loc="lower center", bbox_to_anchor=(0.5, 0.005),
                ncol=4, frameon=False)
-    fig.tight_layout(rect=(0, 0.20, 1, 1), w_pad=1.4)
-    return fig
-
-
-def plot_expert_collective_timelines(result: Mapping[str, Any]) -> Any:
-    """Plot expert-only DoS/DoA for the Couzin data behind an analysis."""
-
-    import matplotlib.pyplot as plt
-
-    fa.set_paper_style()
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.75))
-    colors = {16: "#2563A6", 32: "#6F4E9C"}
-    is_event_window = "approach" in result["spec"].name
-    for metric_index, (ax, metric) in enumerate(zip(axes, ("dos", "doa"))):
-        for n_prey in (16, 32):
-            timelines = result["groups"][n_prey]["expert_analysis"][f"{metric}_timeline"]
-            width = min(len(value) for value in timelines)
-            matrix = torch.stack([value[:width].float().cpu() for value in timelines])
-            mean = matrix.mean(dim=0)
-            if len(matrix) > 1:
-                generator = torch.Generator(device="cpu").manual_seed(
-                    31_337 + 100 * metric_index + n_prey)
-                index = torch.randint(len(matrix), (1000, len(matrix)), generator=generator)
-                draws = matrix[index].mean(dim=1)
-                low, high = torch.quantile(
-                    draws, torch.tensor([0.025, 0.975]), dim=0)
-            else:
-                low = high = mean
-            x = np.arange(width) * result["spec"].dt
-            ax.plot(x, mean, color=colors[n_prey], linewidth=1.6,
-                    label=f"Couzin, N={n_prey}")
-            ax.fill_between(x, low, high, color=colors[n_prey], alpha=0.14, linewidth=0)
-        ax.set_title("Couzin Degree of Swarm (DoS)" if metric == "dos"
-                     else "Couzin Degree of Alignment (DoA)")
-        ax.set_xlabel("Time from approach onset" if is_event_window
-                      else "Couzin simulation time")
-        ax.set_ylabel(fa.METRIC_SPECS[metric]["unit"])
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.005),
-               ncol=2, frameon=False)
     fig.tight_layout(rect=(0, 0.20, 1, 1), w_pad=1.4)
     return fig
 
@@ -1249,10 +1209,6 @@ def save_variant_artifacts(
     pdf, png = fa.save_figure(fig, output_dir / f"{name}_collective_timeline")
     paths.extend((pdf, png))
     plt.close(fig)
-    fig = plot_expert_collective_timelines(result)
-    pdf, png = fa.save_figure(fig, output_dir / f"{name}_couzin_dos_doa")
-    paths.extend((pdf, png))
-    plt.close(fig)
     return paths
 
 
@@ -1266,6 +1222,6 @@ __all__ = [
     "evaluate_approach_variant", "evaluate_large_approach_cohort",
     "evaluate_variant", "evaluate_variants",
     "result_rows", "provenance_audit", "quality_gate", "plot_behavior_boxplots",
-    "plot_collective_timelines", "plot_expert_collective_timelines",
+    "plot_collective_timelines",
     "save_variant_artifacts",
 ]
