@@ -1,9 +1,3 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from utils.encoder_utils import *
-from utils.train_utils import compute_wasserstein_loss, gradient_penalty
-
 """
 References:
 Wu et al. (2025) - Adversarial imitation learning with deep attention network for swarm systems (https://doi.org/10.1007/s40747-024-01662-2)
@@ -12,6 +6,12 @@ Wu et al. (2025) - CBIL: Collective Behavior Imitation Learning for Fish from Re
 Initial structure derived from CBIL GitHub repository:
 https://github.com/littlecobber/CBIL
 """
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from utils.encoder_utils import *
+from utils.train_utils import compute_wasserstein_loss, gradient_penalty, alive_mask
 
 
 class Discriminator(nn.Module):
@@ -58,6 +58,7 @@ class Discriminator(nn.Module):
         # add noise to inputs for discriminator regularization
         # helps with GAIL balancing, noise regularizes the discriminator performance in early training stages
         if noise > 0.0:
+            
             # noise only until half of training, with linear decay
             noise_until = 0.5 * num_generations
             decay = 1.0 - (generation / noise_until)
@@ -76,11 +77,15 @@ class Discriminator(nn.Module):
         exp_scores = self.forward(expert_batch)
         gen_scores = self.forward(policy_batch)
 
+        m_e, m_g = alive_mask(expert_batch), alive_mask(policy_batch)
+        exp_mean = (exp_scores * m_e).sum() / m_e.sum().clamp_min(1.0)
+        gen_mean = (gen_scores * m_g).sum() / m_g.sum().clamp_min(1.0)
+
         # gradient penalty
         grad_penalty = gradient_penalty(self, expert_batch, policy_batch)
 
         # wasserstein loss with gradient penalty
-        loss, loss_gp = compute_wasserstein_loss(exp_scores, gen_scores, lambda_gp, grad_penalty)
+        loss, loss_gp = compute_wasserstein_loss(exp_mean, gen_mean, lambda_gp, grad_penalty)
 
         # optimization step
         optim_dis.zero_grad()
@@ -91,13 +96,14 @@ class Discriminator(nn.Module):
             "dis_loss": round(loss.item(), 4),
             "dis_loss_gp": round(loss_gp.item(), 4),
             "grad_penalty": round(grad_penalty.item(), 4),
-            "expert_score_mean": round(exp_scores.mean().item(), 4),
-            "policy_score_mean": round(gen_scores.mean().item(), 4),
+            "expert_score_mean": round(exp_mean.item(), 4),
+            "policy_score_mean": round(gen_mean.item(), 4),
         }
 
     # https://stackoverflow.com/questions/63627997/reset-parameters-of-a-neural-network-in-pytorch
     def set_parameters(self, init=True):
-        # Initialize all parameters
+
+        # initialize all parameters
         if init is True:
             for layer in self.modules():
                 if hasattr(layer, 'reset_parameters'):

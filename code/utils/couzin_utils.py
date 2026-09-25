@@ -1,3 +1,11 @@
+"""
+couzin_utils.py
+
+References:
+Env: https://github.com/hossein-haeri/couzin_swarm_model/blob/master/swarm_pray_predator.py
+Changed to 2D only, added logging tensors
+"""
+
 import pylab
 import torch
 import numpy as np
@@ -7,11 +15,6 @@ from utils.eval_utils import *
 import matplotlib.pyplot as plt
 from utils.eval_utils import compute_polarization, compute_angular_momentum, degree_of_sparsity, distance_to_predator, escape_alignment
 
-"""
-References:
-Env: https://github.com/hossein-haeri/couzin_swarm_model/blob/master/swarm_pray_predator.py
-Changed to 2D only, added logging tensors
-"""
 
 class Agent:
     def __init__(self, agent_id, speed, area_width, area_height):

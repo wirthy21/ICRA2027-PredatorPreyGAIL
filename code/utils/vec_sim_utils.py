@@ -1,3 +1,16 @@
+"""
+vec_sim_utils.py:
+In this file are vectorized simulation utilities for predator–prey rollouts,
+policy perturbations, and batched ES environment steps.
+
+References:
+Env Structure: https://github.com/hossein-haeri/couzin_swarm_model/blob/master/swarm_pray_predator.py
+Wall Enforcement: https://github.com/mdodsworth/pyglet-boids/blob/master/boids/boid.py
+Intro to vec envs: https://www.youtube.com/watch?v=Kv5HRTFuo6M
+Really informative article: https://medium.com/data-science/vectorize-and-parallelize-rl-environments-with-jax-q-learning-at-the-speed-of-light-49d07373adf5
+vmap: https://docs.pytorch.org/docs/stable/generated/torch.vmap.html
+"""
+
 import torch
 import numpy as np
 from math import *
@@ -6,26 +19,17 @@ from torch.func import functional_call, vmap
 from collections import OrderedDict
 
 
-"""
-References:
-Env Structure: https://github.com/hossein-haeri/couzin_swarm_model/blob/master/swarm_pray_predator.py
-Wall Enforcement: https://github.com/mdodsworth/pyglet-boids/blob/master/boids/boid.py
-
-Intro to vec envs: https://www.youtube.com/watch?v=Kv5HRTFuo6M
-Really informative article: https://medium.com/data-science/vectorize-and-parallelize-rl-environments-with-jax-q-learning-at-the-speed-of-light-49d07373adf5
-
-vmap: https://docs.pytorch.org/docs/stable/generated/torch.vmap.html
-"""
-
-
 def velocity_from_theta(theta, speed):
     """
     Gets velocity vector from (updated) heading angle and speed
 
-    Input: theta, speed
-    Output: velocity vector
-    """
+    Args:
+        theta: Heading angles (scalar or tensor).
+        speed: Speed (scalar or tensor, broadcastable with theta).
 
+    Returns:
+        vel: Velocity vectors
+    """
     vx = torch.cos(theta) * speed
     vy = torch.sin(theta) * speed
     return torch.stack([vx, vy], dim=-1)
@@ -35,10 +39,14 @@ def apply_turnrate(theta, action, max_turn):
     """
     Updates heading angle based on action and maximum turn rate
     
-    Input: theta, action, max_turn
-    Output: updated theta
-    """
+    Args:
+        theta: Current heading angles (tensor).
+        action: Normalized actions in [0, 1] (tensor, broadcastable with theta).
+        max_turn: Maximum turn angle per step (scalar).
 
+    Returns:
+        theta_new: Updated heading angles
+    """
     # maps normalized action [0,1] to turn rate [-max_turn, max_turn]
     dtheta = (action - 0.5) * 2.0 * max_turn
     theta = theta + dtheta # update theta
@@ -49,8 +57,17 @@ def enforce_walls(pos, theta, area_width, area_height):
     """
     Check and handle collisions with the environment boundaries
     tensor-based on batches
-    """
 
+    Args:
+        pos: Positions tensor [..., 2] (x, y).
+        theta: Heading angles tensor [...].
+        area_width: Environment width.
+        area_height: Environment height.
+
+    Returns:
+        pos_clamped: Positions clamped to the environment bounds.
+        theta_reflected: Reflected and wrapped heading angles.
+    """
     # check for collisions with walls
     bounced_x = (pos[..., 0] < 0) | (pos[..., 0] > area_width)
     bounced_y = (pos[..., 1] < 0) | (pos[..., 1] > area_height)
@@ -75,10 +92,20 @@ def get_state_tensors(prey_log_step, pred_log_step, n_pred=1,
     """
     Converts logs to expert feature tensors, tensor-based version
 
-    Input: pred and prey logs, n_pred, area size, max speed for normalization
-    Output: predator & prey tensor and metrics dict
-    """
+    Args:
+        prey_log_step: Prey log tensor (batch, n_prey, 6) with [x, y, vx, vy, cos_t, sin_t].
+        pred_log_step: Predator log tensor (batch, n_pred, 6) with the same layout.
+        n_pred: Number of predators.
+        area_width: Environment width (for position scaling).
+        area_height: Environment height (for position scaling).
+        max_speed_norm: Max speed used to clip and normalize relative velocities.
+        neigh_idx: Index tensor (n_agents, n_neigh) specifying neighbor ordering.
 
+    Returns:
+        pred_tensor: Predator state tensor (batch, n_pred, n_neigh, feat).
+        prey_tensor: Prey state tensor (batch, n_prey, n_neigh, feat), including
+                     predator flag (if n_pred > 0) and an active channel.
+    """
     # combine predator and prey logs
     device = prey_log_step.device
     combined = torch.cat([pred_log_step, prey_log_step], dim=1)
@@ -126,17 +153,27 @@ def get_state_tensors(prey_log_step, pred_log_step, n_pred=1,
 
         # concatenate mask to prey tensor
         prey_tensor = torch.cat([prey_mask, prey_tensor], dim=-1)
+        
+    # append active channel
+    pred_tensor = torch.cat([pred_tensor, torch.ones_like(pred_tensor[..., :1])], dim=-1)
+    prey_tensor = torch.cat([prey_tensor, torch.ones_like(prey_tensor[..., :1])], dim=-1)
 
     return pred_tensor, prey_tensor
-
 
 
 def init_positions_in_env(init_pool, area_width=50, area_height=50, device="cuda"):
     """
     Initializes agents from a given pool of states
 
-    Input: init_pool, area size, device
-    Output: positions, headings
+    Args:
+        init_pool: Tensor of initial states (steps, agents, coordinates).
+        area_width: Environment width (used for centering).
+        area_height: Environment height (used for centering).
+        device: Torch device for the output tensors.
+
+    Returns:
+        positions: Centered positions (agents, 2).
+        theta: Headings (agents,).
     """
 
     # sample random initial state
@@ -162,12 +199,32 @@ def run_env_vectorized(prey_policy=None, pred_policy=None,
                        deterministic=False,
                        prey_speed=5, pred_speed=5, 
                        area_width=50, area_height=50, max_turn=np.pi, 
-                       init_pool=None, device="cuda"):
+                       init_pool=None, device="cuda", max_speed_norm=5):
     
     """
-    This version was keep during the development of vectorized batch env.
-    Runs env with given policies for prey and predator each, vectorized.
-    To generated longer trajectories with single policies.
+    Run a vectorized predator–prey simulation for a single policy configuration.
+
+    Args:
+        prey_policy: Prey policy network.
+        pred_policy: Predator policy network (optional; if None, prey-only).
+        n_prey: Number of prey agents.
+        n_pred: Number of predator agents.
+        step_size: Integration step size for position updates.
+        max_steps: Number of simulation steps to run.
+        deterministic: If True, use deterministic policy actions.
+        prey_speed: Constant speed for prey agents.
+        pred_speed: Constant speed for predator agents.
+        area_width: Environment width.
+        area_height: Environment height.
+        max_turn: Maximum turn angle per step.
+        init_pool: Tensor of initial states for `init_positions_in_env`.
+        device: Torch device.
+        max_speed_norm: Max speed used to normalize relative velocities in state tensors.
+
+    Returns:
+        pred_tensor: Predator trajectory tensor (max_steps, n_pred, n_neigh, feat)
+                     or None if n_pred == 0.
+        prey_tensor: Prey trajectory tensor (max_steps, n_prey, n_neigh, feat).
     """
 
     n_agents = n_prey + n_pred
@@ -183,18 +240,17 @@ def run_env_vectorized(prey_policy=None, pred_policy=None,
 
     if n_pred > 0:
         # initialize trajectory tensors
-        prey_traj = torch.empty((max_steps, n_prey, n_neigh, 6), dtype=torch.float32, device=device)
-        pred_traj = torch.empty((max_steps, n_pred, n_neigh, 5), dtype=torch.float32, device=device)
+        prey_traj = torch.empty((max_steps, n_prey, n_neigh, 7), dtype=torch.float32, device=device)
+        pred_traj = torch.empty((max_steps, n_pred, n_neigh, 6), dtype=torch.float32, device=device)
     else:
         # initialize prey-only trajectory tensor
-        prey_traj = torch.empty((max_steps, n_prey, n_neigh, 5), dtype=torch.float32, device=device)
+        prey_traj = torch.empty((max_steps, n_prey, n_neigh, 6), dtype=torch.float32, device=device)
         pred_traj = None
 
     # neighbor indices for state tensor construction
     idx = torch.arange(n_agents, device=device)
     neigh_idx = idx.repeat(n_agents, 1)
     neigh_idx = neigh_idx[~torch.eye(n_agents, dtype=torch.bool, device=device)].view(n_agents, n_agents - 1)
-
 
     t = 0
     with torch.inference_mode():
@@ -221,30 +277,31 @@ def run_env_vectorized(prey_policy=None, pred_policy=None,
             # get state tensors for predators and prey
             pred_states, prey_states = get_state_tensors(prey_log_t.unsqueeze(0), predator_log_t.unsqueeze(0),
                                                          area_width=area_width, area_height=area_height,
-                                                         n_pred=n_pred, max_speed_norm=5, neigh_idx=neigh_idx)
+                                                         n_pred=n_pred, max_speed_norm=max_speed_norm, neigh_idx=neigh_idx)
             pred_states = pred_states[0]
             prey_states = prey_states[0]
             
             if n_pred > 0:
+                
                 # forward pass through both policies
                 pred_actions, pred_weights = pred_policy.forward(pred_states, deterministic=deterministic) 
                 prey_actions, prey_weights = prey_policy.forward(prey_states, deterministic=deterministic)
 
                 # log predator trajectories
-                pred_traj[t, :, :, :4] = pred_states
-                pred_traj[t, :, :, 4:] = pred_actions.unsqueeze(1).expand(-1, n_neigh, -1)
+                pred_traj[t, :, :, :5] = pred_states
+                pred_traj[t, :, :, 5:] = pred_actions.unsqueeze(1).expand(-1, n_neigh, -1)
                 
                 # log prey trajectories
-                prey_traj[t, :, :, :5] = prey_states
-                prey_traj[t, :, :, 5:] = prey_actions.unsqueeze(1).expand(-1, n_neigh, -1)
+                prey_traj[t, :, :, :6] = prey_states
+                prey_traj[t, :, :, 6:] = prey_actions.unsqueeze(1).expand(-1, n_neigh, -1)
             else:
                 # prey-only case forward pass
                 prey_in = prey_states              
                 prey_actions, prey_weights = prey_policy.forward(prey_in, deterministic=deterministic)  # (n_prey,1)
 
                 # log prey trajectories
-                prey_traj[t, :, :, :4] = prey_states
-                prey_traj[t, :, :, 4:] = prey_actions.unsqueeze(1).expand(-1, n_neigh, -1)
+                prey_traj[t, :, :, :5] = prey_states
+                prey_traj[t, :, :, 5:] = prey_actions.unsqueeze(1).expand(-1, n_neigh, -1)
 
             # update headings based on actions
             theta[n_pred:] = apply_turnrate(theta[n_pred:], prey_actions.squeeze(-1), max_turn)
@@ -271,8 +328,17 @@ def init_positions(init_pool, batch=32, area_width=50, area_height=50, mode="dua
     Initializes agents from a given pool of states, batch version
     Important that pos & neg perturbations get same init!
 
-    Input: init_pool, area size, device
-    Output: positions, headings
+    Args:
+        init_pool: Tensor of initial states (steps, agents, coordinates).
+        batch: Number of batch elements (before optional duplication).
+        area_width: Environment width (used for centering).
+        area_height: Environment height (used for centering).
+        mode: "dual" to duplicate samples for mirrored perturbations, otherwise single.
+        device: Torch device for the output tensors.
+
+    Returns:
+        positions: Centered positions (batch_or_2*batch, agents, 2).
+        theta: Headings (batch_or_2*batch,).
     """
 
     # sample random initial states for the batch
@@ -297,7 +363,6 @@ def init_positions(init_pool, batch=32, area_width=50, area_height=50, mode="dua
     return (positions, theta)
 
 
-
 def policy_perturbation(pred_policy, prey_policy, 
                         role="prey", module="pairwise", 
                         sigma=0.1, num_perturbations=32,
@@ -306,10 +371,19 @@ def policy_perturbation(pred_policy, prey_policy,
     """
     Creates positive and negative perturbations of policy parameters
 
-    Input: policies, role, module, sigma, num_perturbations, device
-    Output: perturbed parameter dicts, epsilons
+    Args:
+        pred_policy: Predator policy.
+        prey_policy: Prey policy.
+        role: "prey" or "pred" – which policy to perturb.
+        module: "pairwise" or "attention" – which subnetwork to perturb.
+        sigma: Standard deviation of Gaussian perturbations.
+        num_perturbations: Number of perturbation pairs to generate.
+        device: Torch device for perturbed parameters and epsilons.
+
+    Returns:
+        pert_list_all: List of 2*num_perturbations state dicts
+        epsilons: List of epsilon vectors
     """
-    
     # select policy based on role
     policy = prey_policy if role == "prey" else pred_policy
     base_state_dict = policy.state_dict()
@@ -361,10 +435,17 @@ def policy_perturbation(pred_policy, prey_policy,
 
 def batch_policy_forward(policy, states, pert_list, deterministic=False):
     """
-    Avoids for-loops by batching parameter perturbations
+    Evaluate a policy over a batch of parameter perturbations using vmap.
 
-    Input: policy, states, pert_list, deterministic
-    Output: actions, weights
+    Args:
+        policy: Policy module to evaluate.
+        states: Input states (batch, agents, neighbors, features).
+        pert_list: List of perturbed state dicts.
+        deterministic: If True, run the policy deterministically.
+
+    Returns:
+        actions: Actions for all perturbations and states.
+        weights: Attention weights (or other auxiliary outputs) for all perturbations.
     """
 
     # stack each parameter tensor across perturbations
@@ -386,10 +467,35 @@ def run_batch_env(prey_policy=None, pred_policy=None,
                     max_steps=100, deterministic=False,
                     prey_speed=5, pred_speed=5, 
                     area_width=50, area_height=50, max_turn=np.pi,
-                    init_pos=None, pert_list=None, role="prey", device="cuda"):
+                    init_pos=None, pert_list=None, role="prey", device="cuda", max_speed_norm=5):
     """
     Runs env vectorized with batch processed policy parameter perturbations
     Applied during ES update
+
+    Args:
+        prey_policy: Prey policy network.
+        pred_policy: Predator policy network (optional; if None, prey-only).
+        n_prey: Number of prey agents.
+        n_pred: Number of predator agents.
+        step_size: Integration step size for position updates.
+        batch: Number of parallel perturbations (batch size).
+        max_steps: Number of simulation steps to run.
+        deterministic: If True, run policies deterministically.
+        prey_speed: Constant speed for prey agents.
+        pred_speed: Constant speed for predator agents.
+        area_width: Environment width.
+        area_height: Environment height.
+        max_turn: Maximum turn angle per step.
+        init_pos: Tuple (positions, theta) from `init_positions`.
+        pert_list: List of perturbed state dicts for batched policy evaluation.
+        role: "prey" or "pred" – which policy is perturbed in this ES step.
+        device: Torch device.
+        max_speed_norm: Max speed used to normalize relative velocities in state tensors.
+
+    Returns:
+        pred_tensor: Predator trajectory tensor (batch, max_steps, n_pred, n_neigh, feat)
+                     or None if n_pred == 0.
+        prey_tensor: Prey trajectory tensor (batch, max_steps, n_prey, n_neigh, feat).
     """
 
     n_agents = n_prey + n_pred
@@ -404,11 +510,11 @@ def run_batch_env(prey_policy=None, pred_policy=None,
         speed[:, :n_pred] = float(pred_speed) # set predator speeds
 
         # initialize trajectory tensors
-        prey_traj = torch.empty((batch, max_steps, n_prey, n_neigh, 6), dtype=torch.float32, device=device)
-        pred_traj = torch.empty((batch, max_steps, n_pred, n_neigh, 5), dtype=torch.float32, device=device)
+        prey_traj = torch.empty((batch, max_steps, n_prey, n_neigh, 7), dtype=torch.float32, device=device)
+        pred_traj = torch.empty((batch, max_steps, n_pred, n_neigh, 6), dtype=torch.float32, device=device)
     else:
         # initialize prey-only trajectory tensor
-        prey_traj = torch.empty((batch, max_steps, n_prey, n_neigh, 5), dtype=torch.float32, device=device)
+        prey_traj = torch.empty((batch, max_steps, n_prey, n_neigh, 6), dtype=torch.float32, device=device)
         pred_traj = None
 
     # neighbor indices for state tensor construction
@@ -441,19 +547,19 @@ def run_batch_env(prey_policy=None, pred_policy=None,
             # get state tensors for predators and prey
             pred_states, prey_states = get_state_tensors(prey_log_t, predator_log_t,
                                                          area_width=area_width, area_height=area_height,
-                                                         n_pred=n_pred, max_speed_norm=5, neigh_idx=neigh_idx)
+                                                         n_pred=n_pred, max_speed_norm=max_speed_norm, neigh_idx=neigh_idx)
 
             if n_pred > 0:
                 # keep env-wise shape
-                pred_in_env = pred_states.view(batch, n_pred, n_neigh, 4)  
-                prey_in_env = prey_states.view(batch, n_prey, n_neigh, 5)  
+                pred_in_env = pred_states.view(batch, n_pred, n_neigh, 5)  
+                prey_in_env = prey_states.view(batch, n_prey, n_neigh, 6)  
 
                 if role == "pred":
                     # pred actions with batched perturbations
                     pred_actions, pred_weights = batch_policy_forward(pred_policy, pred_in_env, pert_list, deterministic=deterministic)
                 else:
                     # pred actions without perturbations, necessary, because only one module is perturbed at a time
-                    pred_actions, pred_weights = pred_policy.forward(pred_in_env.view(batch * n_pred, n_neigh, 4), deterministic=deterministic)
+                    pred_actions, pred_weights = pred_policy.forward(pred_in_env.view(batch * n_pred, n_neigh, 5), deterministic=deterministic)
                     pred_actions = pred_actions.view(batch, n_pred, 1)
 
                 if role == "prey":
@@ -461,32 +567,32 @@ def run_batch_env(prey_policy=None, pred_policy=None,
                     prey_actions, prey_weights = batch_policy_forward(prey_policy, prey_in_env, pert_list, deterministic=deterministic)
                 else:
                     # prey actions without perturbations
-                    prey_actions, prey_weights = prey_policy.forward(prey_in_env.view(batch * n_prey, n_neigh, 5), deterministic=deterministic)
+                    prey_actions, prey_weights = prey_policy.forward(prey_in_env.view(batch * n_prey, n_neigh, 6), deterministic=deterministic)
                     prey_actions = prey_actions.view(batch, n_prey, 1)
 
                 # log predator trajectories
-                pred_traj[:, t, :, :, :4] = pred_states
-                pred_traj[:, t, :, :, 4:] = pred_actions.unsqueeze(3).expand(-1, -1, n_neigh, -1)
+                pred_traj[:, t, :, :, :5] = pred_states
+                pred_traj[:, t, :, :, 5:] = pred_actions.unsqueeze(3).expand(-1, -1, n_neigh, -1)
 
                 # log prey trajectories
-                prey_traj[:, t, :, :, :5] = prey_states
-                prey_traj[:, t, :, :, 5:] = prey_actions.unsqueeze(3).expand(-1, -1, n_neigh, -1)
+                prey_traj[:, t, :, :, :6] = prey_states
+                prey_traj[:, t, :, :, 6:] = prey_actions.unsqueeze(3).expand(-1, -1, n_neigh, -1)
 
             else:
                 # prey-only case
-                prey_in_env = prey_states.view(batch, n_prey, n_neigh, 4)
+                prey_in_env = prey_states.view(batch, n_prey, n_neigh, 5)
 
                 if role == "prey" and pert_list is not None:
                     # prey actions with batched perturbations
                     prey_actions, prey_weights = batch_policy_forward(prey_policy, prey_in_env, pert_list, deterministic=deterministic)
                 else:
                     # prey actions without perturbations
-                    prey_actions, prey_weights = prey_policy.forward(prey_in_env.view(batch * n_prey, n_neigh, 4), deterministic=deterministic)
+                    prey_actions, prey_weights = prey_policy.forward(prey_in_env.view(batch * n_prey, n_neigh, 5), deterministic=deterministic)
                     prey_actions = prey_actions.view(batch, n_prey, 1)
 
                 # log prey trajectories
-                prey_traj[:, t, :, :, :4] = prey_states
-                prey_traj[:, t, :, :, 4:] = prey_actions.unsqueeze(3).expand(-1, -1, n_neigh, -1)
+                prey_traj[:, t, :, :, :5] = prey_states
+                prey_traj[:, t, :, :, 5:] = prey_actions.unsqueeze(3).expand(-1, -1, n_neigh, -1)
 
             # update headings based on actions
             theta[:, n_pred:] = apply_turnrate(theta[:, n_pred:], prey_actions.squeeze(-1), max_turn)
@@ -509,38 +615,55 @@ def run_batch_env(prey_policy=None, pred_policy=None,
 def apply_perturbations(prey_policy, pred_policy, init_pos, 
                         role, module, device,
                         sigma, num_perturbations,
-                        settings_batch_env):
+                        settings_batch_env, n_prey=32):
     
     """
     Applies policy perturbations and runs batch env with them
 
-    Input: policies, init pos, role, module, device,
-           sigma, num_perturbations, batch env settings
-    Output: predator & prey rollouts, epsilons
+    Args:
+        prey_policy: Prey policy network.
+        pred_policy: Predator policy network.
+        init_pos: Initial positions and headings from `init_positions`.
+        role: "prey" or "pred" – which policy to perturb.
+        module: "pairwise" or "attention" – which subnetwork to perturb.
+        device: Torch device.
+        sigma: Standard deviation of perturbations.
+        num_perturbations: Number of perturbation pairs.
+        settings_batch_env: Tuple/list with environment settings:
+                          [area_height, area_width, prey_speed, pred_speed,
+                           step_size, max_turn, max_steps, max_speed_norm].
+        n_prey: Number of prey agents (used in `run_batch_env`).
+
+    Returns:
+        pred_rollouts: Predator rollouts (batch, steps, n_pred, n_neigh, feat) or None.
+        prey_rollouts: Prey rollouts (batch, steps, n_prey, n_neigh, feat).
+        epsilons: List of epsilon vectors used for the perturbations.
     """
     
     # create perturbations
     pert_list, epsilons = policy_perturbation(pred_policy, prey_policy,
-                                            role=role, module=module,
-                                            sigma=sigma, num_perturbations=num_perturbations,
-                                            device=device)
+                                              role=role, module=module,
+                                              sigma=sigma, num_perturbations=num_perturbations,
+                                              device=device)
     
     n_pred = 1 if pred_policy is not None else 0
 
     # run batch env with perturbations
     pred_rollouts, prey_rollouts = run_batch_env(prey_policy=prey_policy, 
-                                                 pred_policy=pred_policy,
-                                                 n_pred=n_pred,
-                                                 step_size=settings_batch_env[4],
-                                                 batch=2*num_perturbations, 
-                                                 max_steps=settings_batch_env[6],
-                                                 prey_speed=settings_batch_env[2],
-                                                 pred_speed=settings_batch_env[3],
-                                                 area_width=settings_batch_env[1],
-                                                 area_height=settings_batch_env[0],
-                                                 max_turn=settings_batch_env[5],
-                                                 init_pos=init_pos, 
-                                                 pert_list=pert_list, 
-                                                 role=role)
+                                                  pred_policy=pred_policy,
+                                                  n_prey=n_prey,
+                                                  n_pred=n_pred,
+                                                  step_size=settings_batch_env[4],
+                                                  batch=2*num_perturbations, 
+                                                  max_steps=settings_batch_env[6],
+                                                  prey_speed=settings_batch_env[2],
+                                                  pred_speed=settings_batch_env[3],
+                                                  max_speed_norm=settings_batch_env[7],
+                                                  area_width=settings_batch_env[1],
+                                                  area_height=settings_batch_env[0],
+                                                  max_turn=settings_batch_env[5],
+                                                  init_pos=init_pos, 
+                                                  pert_list=pert_list, 
+                                                  role=role)
     
     return pred_rollouts, prey_rollouts, epsilons

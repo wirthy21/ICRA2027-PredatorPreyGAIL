@@ -1,13 +1,11 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 """
 References:
 Wu et al. (2025) - Adversarial imitation learning with deep attention network for swarm systems (https://doi.org/10.1007/s40747-024-01662-2)
 Heras et al. (2019) - Deep attention networks reveal the rules of collective motion in zebrafish (https://doi.org/10.1371/journal.pcbi.1007354)
 """
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class PairwiseInteraction(nn.Module):
     """

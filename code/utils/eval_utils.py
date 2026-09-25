@@ -1,3 +1,17 @@
+"""
+eval_utils.py:
+In this file are the evaluation utilities: Monte Carlo estimation of expert-level MMD/Sinkhorn baselines,
+training/eval/ES diagnostic plotting functions, and the swarm-behavior metrics (polarization,
+angular momentum, sparsity, predator-distance, escape alignment) cited from the swarm-behavior literature.
+
+References:
+Sinkhorn: https://www.kernel-operations.io/geomloss/
+MMD: https://github.com/yiftachbeer/mmd_loss_pytorch/blob/master/mmd_loss.py
+Polarization & Angular Momentum: Wu et al. (2025) - Adversarial imitation learning with deep attention network for swarm systems (https://doi.org/10.1007/s40747-024-01662-2)
+Degree of Sparsity: Predator-prey survival pressure is sufficient to evolve swarming behaviors (https://doi.org/10.48550/arXiv.2308.12624)
+Escape Alignment: Bartashevich et al. (2024) - Collective anti-predator escape manoeuvres through optimal attack and avoidance strategies (https://doi.org/10.1038/s42003-024-07267-2)
+"""
+
 import sys, os
 import numpy as np
 import pandas as pd
@@ -6,16 +20,6 @@ import matplotlib.pyplot as plt
 from geomloss import SamplesLoss
 from utils.encoder_utils import *
 
-"""
-References:
-Sinkhorn: https://www.kernel-operations.io/geomloss/
-MMD: https://github.com/yiftachbeer/mmd_loss_pytorch/blob/master/mmd_loss.py
-
-Polarization & Angular Momentum: Wu et al. (2025) - Adversarial imitation learning with deep attention network for swarm systems (https://doi.org/10.1007/s40747-024-01662-2)
-Degree of Sparsity: Li et al. (2023) - Predator–prey survival pressure is sufficient to evolve swarming behaviors (https://doi.org/10.48550/arXiv.2308.12624)
-Escape Alignment: Bartashevich et al. (2024) - Collective anti-predator escape manoeuvres through optimal attack and avoidance strategies (https://doi.org/10.1038/s42003-024-07267-2)
-
-"""
 
 def get_expert_values(exp_pred_tensor=None, exp_prey_tensor=None, 
                       prey_mmd_loss=None, pred_mmd_loss=None, 
@@ -27,8 +31,20 @@ def get_expert_values(exp_pred_tensor=None, exp_prey_tensor=None,
     The targets are estimated by repeatedly sampling random trajectory windows from the expert dataset and comparing expert samples against each other.
     Monte Carlo estimation over 500 iterations.
 
-    Input: expert tensors, loss functions, encoders
-    Output: means and stds for MMD and Sinkhorn expert values for prey and predator
+    Args:
+        exp_pred_tensor: Expert predator trajectories (optional).
+        exp_prey_tensor: Expert prey trajectories.
+        prey_mmd_loss: MMD loss module for prey.
+        pred_mmd_loss: MMD loss module for predators.
+        prey_encoder: Encoder for prey trajectories.
+        pred_encoder: Encoder for predator trajectories.
+        sinkhorn_loss: Sinkhorn loss module.
+
+    Returns:
+        mmd_means: (prey_mean, pred_mean_or_None).
+        mmd_stds: (prey_std, pred_std_or_None).
+        sinkhorn_means: (prey_mean, pred_mean_or_None).
+        sinkhorn_stds: (prey_std, pred_std_or_None).
     """
 
     prey_mmd_list = []
@@ -39,8 +55,8 @@ def get_expert_values(exp_pred_tensor=None, exp_prey_tensor=None,
 
     for i in tqdm(range(500)):
         # sample expert data
-        expert_prey_batch1 = sample_data(exp_prey_tensor, batch_size=10, window_len=10)
-        expert_prey_batch2 = sample_data(exp_prey_tensor, batch_size=10, window_len=10)
+        expert_prey_batch1, _ = sample_data(exp_prey_tensor, batch_size=10, window_len=10)
+        expert_prey_batch2, _ = sample_data(exp_prey_tensor, batch_size=10, window_len=10)
 
         # compute prey MMD
         prey_mmd = prey_mmd_loss(expert_prey_batch1, expert_prey_batch2).item()
@@ -58,8 +74,8 @@ def get_expert_values(exp_pred_tensor=None, exp_prey_tensor=None,
         # if predator data is provided compute MMD and Sinkhorn
         if exp_pred_tensor is not None:
             # sample expert data
-            expert_pred_batch1 = sample_data(exp_pred_tensor, batch_size=10, window_len=10)
-            expert_pred_batch2 = sample_data(exp_pred_tensor, batch_size=10, window_len=10)
+            expert_pred_batch1, _ = sample_data(exp_pred_tensor, batch_size=10, window_len=10)
+            expert_pred_batch2, _ = sample_data(exp_pred_tensor, batch_size=10, window_len=10)
 
             # compute pred MMD
             pred_mmd = pred_mmd_loss(expert_pred_batch1, expert_pred_batch2).item()
@@ -100,7 +116,11 @@ def plot_train_metrics(disc_metrics, dis_balance_factor, role="prey", save_dir=N
     """
     Plots the training discriminator metrics over generations
 
-    Input: discriminator metrics, balance factor, role, save directory
+    Args:
+        disc_metrics: List of discriminator metric dicts from training.
+        dis_balance_factor: Number of discriminator steps per generation.
+        role: "prey" or "pred" – which role’s metrics to plot.
+        save_dir: Optional directory to save the figure.
     """
 
     # prepare dataframe
@@ -151,7 +171,16 @@ def plot_eval_metrics(metrics_list,
     """
     Plots Sinkhorn and MMD metrics over evaluation generations, comparing against expert target value
 
-    Input: Sinkhorn and MMD metrics, role, save directory, eval steps, max steps
+    Args:
+        metrics_list: List of evaluation metric dicts (from `calculate_metrics`).
+        mmd_means: (prey_mean, pred_mean) expert MMD baselines.
+        sinkhorn_means: (prey_mean, pred_mean) expert Sinkhorn baselines.
+        mmd_stds: (prey_std, pred_std) expert MMD standard deviations.
+        sinkhorn_stds: (prey_std, pred_std) expert Sinkhorn standard deviations.
+        role: "prey" or "pred" – which role’s metrics to plot.
+        save_dir: Optional directory to save the figure.
+        eval_steps: Number of generations between evaluation points.
+        max_steps: Maximum generation count for x-axis limits.
     """
     
     # calculate length of x-axis
@@ -216,7 +245,11 @@ def plot_es_metrics(policy_metrics, role="prey", save_dir=None):
     """
     Plots gradient step size and reward-diff std over generations
 
-    Input: policy metrics, role, save directory
+    Args:
+        policy_metrics: Nested list of metric dicts from ES updates
+                        [gen][module_idx][role]["delta_norm", "diff_std", ...].
+        role: "prey" or "pred" – which role’s metrics to plot.
+        save_dir: Optional directory to save the figure.
     """
 
     # generations and metrics
@@ -263,8 +296,12 @@ def compute_polarization(vx, vy):
     """
     Computes the polarization score
 
-    Input: velocities in x and y directions
-    Output: polarization score
+    Args:
+        vx: Velocity x-components (N,).
+        vy: Velocity y-components (N,).
+
+    Returns:
+        polarization_score: Scalar in [0, 1].
     """
 
     # stack velocities and normalize
@@ -282,8 +319,14 @@ def compute_angular_momentum(x, y, vx, vy):
     """
     Computes the angular momentum score
 
-    Input: x and y coordinates, velocities in x and y directions
-    Output: angular momentum score
+    Args:
+        x: x-coordinates (N,).
+        y: y-coordinates (N,).
+        vx: Velocity x-components (N,).
+        vy: Velocity y-components (N,).
+
+    Returns:
+        angular_momentum: Scalar (absolute mean of z-component of r × v̂).
     """
 
     # stack positions and velocities
@@ -310,8 +353,12 @@ def degree_of_sparsity(xs, ys):
     """
     Computes the degree of sparsity (nearest-neighbor distance)
 
-    Input: x and y coordinates
-    Output: mean nearest neighbor distance
+    Args:
+        xs: x-coordinates (N,).
+        ys: y-coordinates (N,).
+
+    Returns:
+        mean_nn_distance: Average distance to the nearest neighbor.
     """
 
     # stack positions
@@ -333,8 +380,12 @@ def distance_to_predator(xs, ys):
     """
     Computes the distance to predator
 
-    Input: x and y coordinates
-    Output: distance to predator
+    Args:
+        xs: x-coordinates (N,).
+        ys: y-coordinates (N,).
+
+    Returns:
+        distance: Scalar distance from prey center to predator.
     """
 
     # separate predator and prey positions
@@ -350,8 +401,12 @@ def pred_distance_to_nearest_prey(xs, ys):
     """
     Computes predator distance to nearest prey
 
-    Input: x and y coordinates
-    Output: nearest prey distance to predator
+    Args:
+        xs: x-coordinates (N,).
+        ys: y-coordinates (N,).
+
+    Returns:
+        distance: Scalar distance to the closest prey agent.
     """
 
     # extract predator and prey positions
@@ -367,8 +422,14 @@ def escape_alignment(xs, ys, vxs, vys):
     """
     Computes the escape alignment
 
-    Input: x and y coordinates, velocities in x and y directions
-    Output: escape alignment
+    Args:
+        xs: x-coordinates (N,).
+        ys: y-coordinates (N,).
+        vxs: Velocity x-components (N,).
+        vys: Velocity y-components (N,).
+
+    Returns:
+        alignment: Mean cosine similarity between velocity and escape direction.
     """
 
     # separate predator and prey positions and velocities

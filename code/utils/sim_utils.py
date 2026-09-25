@@ -1,3 +1,13 @@
+"""
+sim_utils.py:
+In this file are functions important to the simulation environment's core:
+agent dynamics, conversion of simulation logs into tensors, and the full policy rollout loop.
+
+References:
+Env Structure: https://github.com/hossein-haeri/couzin_swarm_model/blob/master/swarm_pray_predator.py
+Wall Enforcement: https://github.com/mdodsworth/pyglet-boids/blob/master/boids/boid.py
+"""
+
 import pylab
 import torch
 import numpy as np
@@ -8,22 +18,15 @@ import matplotlib.pyplot as plt
 from utils.eval_utils import compute_polarization, compute_angular_momentum, degree_of_sparsity, distance_to_predator, escape_alignment
 
 
-"""
-References:
-Env Structure: https://github.com/hossein-haeri/couzin_swarm_model/blob/master/swarm_pray_predator.py
-Wall Enforcement: https://github.com/mdodsworth/pyglet-boids/blob/master/boids/boid.py
-"""
-
-
 class Agent:
     def __init__(self, agent_id, speed, area_width, area_height):
-        # Initialize agent with random position
+        # initialize agent with random position
         self.id = agent_id
         self.speed = float(speed)
         self.pos = np.array([np.random.uniform(0, area_width),
                              np.random.uniform(0, area_height)], dtype=np.float64)
 
-        # Initialize a random heading angle, derive the velocity vector from it
+        # initialize a random heading angle, derive the velocity vector from it
         self.theta = np.random.uniform(-np.pi, np.pi)
         self.vel = np.array([np.cos(self.theta), np.sin(self.theta)], dtype=np.float64) * speed
 
@@ -36,8 +39,13 @@ class Agent:
 def apply_turnrate_on_theta(agent, action, speed, max_turn):
     """
     Update the agents heading angle and velocity based on the policy action
-    """
 
+    Args:
+        agent: Agent instance to update.
+        action: Normalized action in [0, 1].
+        speed: Agent speed (scalar).
+        max_turn: Maximum turn angle per step.
+    """
     # maps normalized action [0,1] to turn rate [-max_turn, max_turn]
     dtheta = (action - 0.5) * 2.0 * max_turn
 
@@ -51,6 +59,11 @@ def apply_turnrate_on_theta(agent, action, speed, max_turn):
 def enforce_walls(agent, area_width, area_height):
     """
     Check and handle collisions with the environment boundaries
+
+    Args:
+        agent: Agent instance.
+        area_width: Environment width.
+        area_height: Environment height.
     """
     bounced = False
 
@@ -88,8 +101,19 @@ def get_state_tensors(prey_log_step, pred_log_step, n_pred=1,
     """
     Converts logs to expert feature tensors (derived from Wu et al. 2025)
 
-    Input: pred and prey logs, n_pred, area size, max speed for normalization
-    Output: predator & prey tensor and metrics dict
+    Args:
+        prey_log_step: Prey log for a single timestep (positions, velocities, directions).
+        pred_log_step: Predator log for a single timestep.
+        n_pred: Number of predators.
+        area_width: Environment width (for position scaling).
+        area_height: Environment height (for position scaling).
+        max_speed_norm: Max speed used to clip and normalize relative velocities.
+        mask: Boolean mask to exclude self-interactions (e.g., ~eye(n_agents)).
+
+    Returns:
+        pred_tensor: Predator state tensor (n_pred, neigh, feat).
+        prey_tensor: Prey state tensor (n_prey, neigh, feat), with predator flag and active mask.
+        metrics: Dict of swarm-level metrics and intermediate quantities.
     """
     
     # combine predator and prey logs
@@ -135,6 +159,13 @@ def get_state_tensors(prey_log_step, pred_log_step, n_pred=1,
         flag[:, :n_pred, 0] = 1
         prey_tensor = torch.cat([flag, prey_tensor], dim=-1)
 
+    # append active-mask column
+    pred_active = torch.ones(pred_tensor.shape[:-1] + (1,), dtype=pred_tensor.dtype, device=pred_tensor.device)
+    pred_tensor = torch.cat([pred_tensor, pred_active], dim=-1)
+
+    prey_active = torch.ones(prey_tensor.shape[:-1] + (1,), dtype=prey_tensor.dtype, device=prey_tensor.device)
+    prey_tensor = torch.cat([prey_tensor, prey_active], dim=-1)
+
     # compute swarm metrics
     polarization = compute_polarization(vxs, vys)
     angular_momentum_val = compute_angular_momentum(xs, ys, vxs, vys)
@@ -166,7 +197,16 @@ def get_state_tensors(prey_log_step, pred_log_step, n_pred=1,
 def apply_init_pool(init_pool, pred, prey, area_width=50, area_height=50, experiment=False):
     """
     Initializes agents from a given pool of states
-    Experiment mode: needed for trajectory prediction expertiment
+
+    Args:
+        init_pool: Tensor of initial states (timesteps, agents, coordinates) or
+                   (agents, coordinates) in experiment mode.
+        pred: List of predator Agent instances.
+        prey: List of prey Agent instances.
+        area_width: Environment width (used for centering in standard mode).
+        area_height: Environment height (used for centering in standard mode).
+        experiment: If True, treat `init_pool` as a fixed initial configuration
+                    and skip sampling/centering.
     """
     n_pred = len(pred)
     n_prey = len(prey)
@@ -207,18 +247,41 @@ def apply_init_pool(init_pool, pred, prey, area_width=50, area_height=50, experi
         agent.vel = np.array([np.cos(agent.theta), np.sin(agent.theta)], dtype=np.float64) * agent.speed
 
 
-
 def run_env_simulation(prey_policy=None, pred_policy=None, 
                        n_prey=32, n_pred=1, step_size=0.5,
                        max_steps=100, deterministic=False,
                        prey_speed=5, pred_speed=5, 
                        area_width=50, area_height=50, 
                        max_turn=np.pi, visualization='off', 
-                       init_pool=None, experiment=False):
+                       init_pool=None, experiment=False, max_speed_norm=5):
     
     """
     Runs env with given policies for prey and predator each.
     Primary purpose is visualization and data generation for analysis.
+
+    Args:
+        prey_policy: Prey policy network.
+        pred_policy: Predator policy network.
+        n_prey: Number of prey agents.
+        n_pred: Number of predator agents.
+        step_size: Integration step size for position updates.
+        max_steps: Number of simulation steps to run.
+        deterministic: If True, use deterministic policy actions (no sampling).
+        prey_speed: Constant speed for prey agents.
+        pred_speed: Constant speed for predator agents.
+        area_width: Environment width.
+        area_height: Environment height.
+        max_turn: Maximum turn angle per step.
+        visualization: If 'on', render live quiver plots of agents.
+        init_pool: Optional tensor of initial states for `apply_init_pool`.
+        experiment: If True, run `apply_init_pool` in experiment mode (fixed init).
+        max_speed_norm: Max speed used to normalize relative velocities in state tensors.
+
+    Returns:
+        pred_tensor: Predator trajectory tensor (or None if n_pred == 0).
+        prey_tensor: Prey trajectory tensor.
+        extras: Tuple (metrics_list, weights_list) with per-step swarm metrics
+                and attention-weight logs.
     """
 
     # deepcopy policies to avoid problems with device handling
@@ -238,10 +301,11 @@ def run_env_simulation(prey_policy=None, pred_policy=None,
         apply_init_pool(init_pool, pred, prey, area_width=area_width, area_height=area_height, experiment=True)
 
     # prepare tensors to log trajectories
+    # allocate an additional feature
     n_agents = n_prey + n_pred
     neigh = n_agents - 1
-    prey_traj = torch.empty((max_steps, n_prey, neigh, 6), dtype=torch.float32) if n_pred > 0 else torch.empty((max_steps, n_prey, neigh, 5), dtype=torch.float32)
-    pred_traj = torch.empty((max_steps, n_pred, neigh, 5), dtype=torch.float32) if n_pred > 0 else None
+    prey_traj = torch.empty((max_steps, n_prey, neigh, 7), dtype=torch.float32) if n_pred > 0 else torch.empty((max_steps, n_prey, neigh, 6), dtype=torch.float32)
+    pred_traj = torch.empty((max_steps, n_pred, neigh, 6), dtype=torch.float32) if n_pred > 0 else None
 
     # visualization setup
     if visualization == 'on':
@@ -312,24 +376,25 @@ def run_env_simulation(prey_policy=None, pred_policy=None,
 
         # get state tensors and metrics from logs
         pred_states, prey_states, metrics = get_state_tensors(prey_log_t, predator_log_t, n_pred=n_pred,
+                                                              max_speed_norm=max_speed_norm,
                                                               area_width=area_width, area_height=area_height, 
                                                               mask=mask)
         
         metrics_list.append(metrics)
 
-        # Policy forward pass to get actions
+        # policy forward pass to get actions
         if n_pred > 0:
             with torch.inference_mode():
                 # predator policy forward
                 pred_actions, pred_weights = pred_policy.forward(pred_states, deterministic=deterministic)
-                pred_traj[t, :, :, :4] = pred_states
-                pred_traj[t, :, :, 4:] = pred_actions.unsqueeze(1).expand(-1, neigh, -1)
+                pred_traj[t, :, :, :5] = pred_states
+                pred_traj[t, :, :, 5:] = pred_actions.unsqueeze(1).expand(-1, neigh, -1)
 
             with torch.inference_mode():
                 # prey policy forward
                 prey_actions, prey_weights = prey_policy.forward(prey_states, deterministic=deterministic)
-                prey_traj[t, :, :, :5] = prey_states
-                prey_traj[t, :, :, 5:] = prey_actions.unsqueeze(1).expand(-1, neigh, -1)
+                prey_traj[t, :, :, :6] = prey_states
+                prey_traj[t, :, :, 6:] = prey_actions.unsqueeze(1).expand(-1, neigh, -1)
 
             # store weights and indices for analysis of swarm composition
             weights = (pred_weights.detach().cpu().numpy(), prey_weights.detach().cpu().numpy())
@@ -340,8 +405,8 @@ def run_env_simulation(prey_policy=None, pred_policy=None,
             with torch.inference_mode():
                 # prey-only case policy forward
                 prey_actions, prey_weights = prey_policy.forward(prey_states, deterministic=deterministic)
-                prey_traj[t, :, :, :4] = prey_states
-                prey_traj[t, :, :, 4:] = prey_actions.unsqueeze(1).expand(-1, neigh, -1)
+                prey_traj[t, :, :, :5] = prey_states
+                prey_traj[t, :, :, 5:] = prey_actions.unsqueeze(1).expand(-1, neigh, -1)
             
             # store weights and indices for analysis of swarm composition
             weights = (None, prey_weights.detach().cpu().numpy())
@@ -365,7 +430,6 @@ def run_env_simulation(prey_policy=None, pred_policy=None,
             # wall enforcement and position update for prey
             enforce_walls(agent, area_width, area_height)
             agent.update_position(step_size=step_size)
-            
 
         if n_pred > 0:
             for predator in pred:

@@ -1,11 +1,8 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from models.ModularNetworks import Attention
-
-
 """
+encoder_utils.py:
+This file implements a VICReg-based self-supervised, neighbor aware encoder to learn latent representations of
+predator-prey dynamics from windowed multi-agent state sequences.
+
 References:
 Wu et al. (2025) - CBIL: Collective Behavior Imitation Learning for Fish from Real Videos (https://doi.org/10.48550/arXiv.2504.00234)
 Bardes et al (2022) - VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning (https://arxiv.org/abs/2105.04906)
@@ -19,30 +16,32 @@ VigRec:
 https://github.com/facebookresearch/vicreg
 https://medium.com/@ttleseuldace/paper-review-vicreg-for-self-supervised-learning-a8f7cfc849cb
 https://github.com/augustwester/vicreg/blob/main/model.py
+
 """
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from models.ModularNetworks import Attention
 
 
 class NeighborPooling(nn.Module):
     """
-    Pools neighbor-wise features for each focal agent into a single embedding
-    Structure is similar to policy networks, uses modular networks with original attention/aggregation network
-    Only, structural difference is the single output neuron, instead of mu and sigma
+    Pools neighbor-wise features for each focal agent into a single embedding.
 
-    Input: tensor of shape (batch*frames, agents, neighbors, features), without action feature
-    Output: pooled embeddings (..., agents, embd_dim)
+    Input:  (..., agents, neighbors, features) tensor (no action channel)
+    Output: (..., agents, embd_dim) pooled embeddings
     """
     def __init__(self, features=4, embd_dim=32):
         super().__init__()
+        input_dim = features * 2 # features + mask
 
-        input_dim = features * 2 # necessary due to masking
-
-        # Neighbor embedding, maps each neighbor feature vector to embd_dim
+        # neighbor embedding, maps each neighbor feature vector to embd_dim
         self.embed = nn.Sequential(nn.Linear(input_dim, 64),
                                    nn.LeakyReLU(0.1),
                                    nn.Linear(64, embd_dim),
                                    nn.LeakyReLU(0.1))
-
-        # same attention class as in ModularNetworks.py
         self.attention = Attention(input_dim)
 
     def forward(self, states, neigh_mask=None, feat_mask=None):
@@ -56,7 +55,7 @@ class NeighborPooling(nn.Module):
         # concatenate masked features
         cat_states = torch.cat([states, feat_mask], dim=-1)
 
-        # compute neigh embeddings and attention weights
+        # compute neighbor embeddings and attention logits
         embed = self.embed(cat_states)
         weights_logit = self.attention(cat_states)
 
@@ -64,41 +63,42 @@ class NeighborPooling(nn.Module):
         if neigh_mask is not None:
             weights_logit = weights_logit.masked_fill(neigh_mask == 0, float("-inf"))
 
-        # normalize weights across neigh dim
+        # softmax over neighbors and weighted sum
         weights = torch.softmax(weights_logit, dim=2)
-
-        # weighted sum pooling
-        pooled = (embed * weights).sum(dim=2)
-
-        return pooled
+        return (embed * weights).sum(dim=2)
     
 
 class AgentEmbedding(nn.Module):
     """
-    Maps pooled neighbor embedding to a latent state z for each focal agent.
+    Maps pooled neighbor embeddings to a latent state z for each focal agent.
 
-    Input: pooled neighbord embeddings
-    Output: latent agent state z
+    Input:  (..., embd_dim) pooled embeddings
+    Output: (..., z) latent agent states
     """
     def __init__(self, embd_dim=32, z=32):
         super().__init__()
-
-        # MLP to map pooled embedding to latent state
-        self.embed = nn.Sequential(nn.Linear(embd_dim, 64),
-                                   nn.LeakyReLU(0.1),
-                                   nn.Linear(64, z))
+        self.embed = nn.Sequential(
+            nn.Linear(embd_dim, 64),
+            nn.LeakyReLU(0.1),
+            nn.Linear(64, z),
+        )
 
     def forward(self, pooled_embd):
-        embed = self.embed(pooled_embd)
-        return embed
+        return self.embed(pooled_embd)
 
 
 class TransitionEncoder(nn.Module):
     """
-    Final Encoder, combines neighbor pooling and agent embedding to map states to latent states z
+    Encoder that maps states to latent states and transition features.
+    
+    Input:
+        states: (batch, frames, agents, neighbors, features)
+        neigh_mask: optional (batch, frames, agents, neighbors, 1)
+        feat_mask:  optional (batch, frames, agents, neighbors, features)
 
-    Input: states, neigh_mask, feat_mask
-    Output: z_state (batch, frames, agents, z), transition_feature (batch, frames-1, agents, 2*z)
+    Output:
+        z_state: (batch, frames, agents, z)
+        transition_feature: (batch, frames-1, agents, 2*z)
     """
 
     def __init__(self, features=4, embd_dim=32, z=32):
@@ -140,11 +140,14 @@ class TransitionEncoder(nn.Module):
         return z_state, transition_feature
     
 
-
 class TrajectoryAugmentation(nn.Module):
     """
     Generates two augmented "views" of the same trajectory states for VICReg
     Augmentations: Gaussian noise, neighbor dropout, feature dropout
+
+    Special handling:
+    - Protects flag column (prey-only, index 0) and active/padding column (last index)
+    from feature dropout and noise. This allows padding and role flags to stay consistent across views.
 
     Input: states
     Output: augmented states, neigh_mask, feat_mask
@@ -157,31 +160,34 @@ class TrajectoryAugmentation(nn.Module):
         self.feat_drop = feat_drop
 
     def forward(self, states):
+        
         batch, frames, agents, neigh, features = states.shape
         device = states.device
 
-        # create masks initialized with ones (keep all)
+        # start with “keep all” masks
         neigh_mask = torch.ones((batch, frames, agents, neigh, 1), device=device, dtype=states.dtype)
         feat_mask  = torch.ones((batch, frames, agents, neigh, features), device=device, dtype=states.dtype)
 
-        # drop neighbors with probability neigh_drop
+        # neighbor dropout
         if self.neigh_drop > 0:
             neigh_mask = (torch.rand(batch, frames, agents, neigh, 1, device=device) > self.neigh_drop).float()
 
-        # drop features with probability feat_drop
+        # feature dropout
         if self.feat_drop > 0:
             feat_mask = (torch.rand(batch, frames, agents, 1, features, device=device) > self.feat_drop).float()
-            feat_mask = feat_mask.expand(batch, frames, agents, neigh, features)
+            feat_mask = feat_mask.expand(batch, frames, agents, neigh, features).clone()
 
-        # edge case: always keep flag feature (prey-only)
-        if features == 5:
+        # protect the flag column (prey only, index 0) and the active column (both roles, last index)
+        if features == 6:  # prey with active column
             feat_mask[..., 0] = 1.0
+        feat_mask[..., -1] = 1.0  # active/padding column
 
         # add Gaussian noise
         if self.noise_std > 0:
             noise = torch.randn_like(states) * self.noise_std
-            if features == 5: # skip flag
+            if features == 6:  # prey with active column
                 noise[..., 0] = 0.0
+            noise[..., -1] = 0.0  # never noise the active column
             states = states + noise
 
         return states, neigh_mask, feat_mask
@@ -190,36 +196,45 @@ class TrajectoryAugmentation(nn.Module):
 class VicRegProjector(nn.Module):
     """
     MLP projector for VICReg
+    
     Maps transition features to a space where VICReg loss is applied
     """
 
     def __init__(self, input_dim=64):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(input_dim, 128),
-                                 nn.BatchNorm1d(128),
-                                 nn.ReLU(),
-                                 nn.Linear(128, 128))
-        
-    def forward(self, states):
-        return self.net(states)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 # https://github.com/facebookresearch/vicreg/blob/main/main_vicreg.py
 def off_diagonal(tensor):
     """
-    Returns all off-diagonal elements of a square matrix as a flat vector
+    Returns off-diagonal elements of a square matrix as a 1D vector
     """
-    dim = tensor.size(0)
-    mask = ~torch.eye(dim, dtype=torch.bool, device=tensor.device)
+    n = tensor.size(0)
+    mask = ~torch.eye(n, dtype=torch.bool, device=tensor.device)
     return tensor[mask]
 
 
 def vicreg_loss(z1, z2, sim_coeff=25.0, std_coeff=15.0, cov_coeff=5.0, eps=1e-4):
     """
-    VICReg loss between two batches of representations z1 and z2
+    VICReg loss between two batches of representations
 
-    Inputs: augmented states representations z1, z2
-    Outputs: vicreg loss, logs dict
+    Args:
+        z1, z2: (batch, dim) tensors of augmented view embeddings.
+        sim_coeff, std_coeff, cov_coeff: Loss weights.
+        eps: Small constant for numerical stability in std computation.
+
+    Returns:
+        loss: Scalar VICReg loss.
+        logs: Dict with per-component losses and std_mean.
     """
 
     # invariance loss
@@ -251,25 +266,46 @@ def vicreg_loss(z1, z2, sim_coeff=25.0, std_coeff=15.0, cov_coeff=5.0, eps=1e-4)
     return loss, logs
 
 
-def sample_data(data, batch_size=10, window_len=10):
+def sample_data(data, batch_size=10, window_len=10, idx=None):
     """
-    Samples a random batch of trajectories from tensor
+    Sample a random batch of trajectory windows from a tensor.
+
+    Args:
+        data: Input tensor (expert or generative).
+        batch_size: Number of windows to sample.
+        window_len: Length of each window along the time axis.
+        idx: Indices.
+
+    Returns:
+        batch: (batch_size, window_len, ...) sampled windows.
+        idx: Indices used for sampling.
     """
-    if data.dim() == 5: # expert tensor 
-        idx = torch.randint(0, data.size(0), (batch_size,), device=data.device)
-        return data[idx]
-    
+    if data.dim() == 5: # expert tensor
+        if idx is None:
+            idx = torch.randint(0, data.size(0), (batch_size,), device=data.device)
+        return data[idx], idx
+
     if data.dim() == 4: # generative tensor
-        trajectory_len = data.size(0)
-        start = torch.randint(0, trajectory_len - window_len + 1, (batch_size,), device=data.device)
-        return torch.stack([data[s:s + window_len] for s in start.tolist()], dim=0) # generate same shape as expert batch
+        if idx is None:
+            trajectory_len = data.size(0)
+            idx = torch.randint(0, trajectory_len - window_len + 1, (batch_size,), device=data.device)
+        return torch.stack([data[s:s + window_len] for s in idx.tolist()], dim=0), idx # generate same shape as expert batch
     
-
-
 
 def train_encoder(encoder, projector, aug, exp_tensor, epochs, optimizer, role="prey"):
     """
-    Self-supervised training of encoder with VICReg
+    Self-supervised training of the encoder with VICReg.
+
+    Uses expert trajectories only, with two augmented views per batch.
+
+    Args:
+        encoder: TransitionEncoder module.
+        projector: VicRegProjector module.
+        aug: TrajectoryAugmentation module.
+        exp_tensor: Expert tensor (dim=5).
+        epochs: Number of training epochs.
+        optimizer: Optimizer for encoder + projector.
+        role: "prey" or "predator" (used in plot title).
     """
 
     device = next(encoder.parameters()).device
@@ -284,7 +320,9 @@ def train_encoder(encoder, projector, aug, exp_tensor, epochs, optimizer, role="
         projector.train()
 
         # sample expert batch
-        expert_batch = sample_data(exp_tensor, batch_size=10, window_len=10).to(device)
+        # used 128 for a better invariance signal
+        expert_batch, _ = sample_data(exp_tensor, batch_size=128, window_len=10)
+        expert_batch = expert_batch.to(device)
 
         # exclude action feature
         states = expert_batch[..., :-1]
@@ -318,7 +356,7 @@ def train_encoder(encoder, projector, aug, exp_tensor, epochs, optimizer, role="
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
-        # gradient clipping, necessary for stable training
+        # gradient clipping for stable training
         nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(projector.parameters()), 1.0)
         optimizer.step()
 
@@ -341,5 +379,4 @@ def train_encoder(encoder, projector, aug, exp_tensor, epochs, optimizer, role="
     plt.legend()
     plt.tight_layout()
     plt.show()
-            
     

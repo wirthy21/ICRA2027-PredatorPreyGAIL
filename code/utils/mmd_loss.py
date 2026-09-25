@@ -1,3 +1,13 @@
+"""
+mmd_loss.py:
+This file implements Maximum Mean Discrepancy (MMD) loss to train imitation policies by
+matching expert and policy trajectory distributions in embedding space.
+
+References:
+(1) https://www.kaggle.com/code/onurtunali/maximum-mean-discrepancy
+(2) https://github.com/yiftachbeer/mmd_loss_pytorch/blob/master/mmd_loss.py
+"""
+
 import sys, os
 import torch
 import numpy as np
@@ -6,11 +16,6 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from models.ModularNetworks import Attention
 
-"""
-References:
-(1) https://www.kaggle.com/code/onurtunali/maximum-mean-discrepancy
-(2) https://github.com/yiftachbeer/mmd_loss_pytorch/blob/master/mmd_loss.py
-"""
 
 class RBF(nn.Module):
     """
@@ -21,7 +26,8 @@ class RBF(nn.Module):
     """
     def __init__(self, n_kernels=5, mul_factor=2.0, bandwidth=None):
         super().__init__()
-        # Changed to buffer, necessary to have easier device handling 
+        
+        # changed to buffer, necessary to have easier device handling 
         self.register_buffer("bandwidth_multipliers", mul_factor ** (torch.arange(n_kernels) - n_kernels // 2))
         self.bandwidth = bandwidth
         
@@ -65,7 +71,7 @@ class MMDLoss(nn.Module):
         X = self.encode_transitions(expert_batch)
         Y = self.encode_transitions(generative_batch)
 
-        # Compute kernel matrix on concatenated samples
+        # compute kernel matrix on concatenated samples
         K = self.kernel(torch.vstack([X, Y]))
 
         X_size = X.shape[0]
